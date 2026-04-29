@@ -88,3 +88,13 @@ third_party/whisper.cpp/bench
 third_party/whisper.cpp/quantize
 third_party/whisper.cpp/server
 third_party/whisper.cpp/lsp
+
+# Common Dev Dependencies & Local Data
+node_modules/
+.venv/
+venv/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.python-version

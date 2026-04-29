@@ -1,0 +1,6 @@
+[submodule "base/TurboMemo"]
+	path = base/TurboMemo
+	url = https://github.com/IzaelNunesDev/TurboMemo.git
+[submodule "base/call_assists"]
+	path = base/call_assists
+	url = https://github.com/IzaelNunesDev/call_assists.git
