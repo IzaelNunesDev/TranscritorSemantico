@@ -346,6 +346,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         replaceSession(
             session.copy(
                 status = "queued",
+                transcriptionEngine = session.safeTranscriptionEngine("pending"),
                 note = "Arquivo aguardando na fila Whisper para transcrição offline.",
                 updatedAt = System.currentTimeMillis(),
             )
@@ -382,6 +383,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 replaceSession(
                     session.copy(
                         status = "transcribing",
+                        transcriptionEngine = session.safeTranscriptionEngine("pending"),
                         note = "Transcrevendo offline com whisper.cpp e VAD local.",
                         updatedAt = System.currentTimeMillis(),
                     )
@@ -438,6 +440,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     replaceSession(
                         failedSession.copy(
                             status = "failed",
+                            transcriptionEngine = failedSession.safeTranscriptionEngine("pending"),
                             note = "Falha na transcrição offline: $detail",
                             updatedAt = System.currentTimeMillis(),
                         )
@@ -576,5 +579,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "es" -> "es"
             else -> "auto"
         }
+    }
+
+    private fun AudioSession.safeTranscriptionEngine(fallback: String): String {
+        val rawValue = runCatching {
+            AudioSession::class.java
+                .getDeclaredField("transcriptionEngine")
+                .apply { isAccessible = true }
+                .get(this) as? String
+        }.getOrNull()
+        return rawValue?.takeIf { it.isNotBlank() } ?: fallback
     }
 }

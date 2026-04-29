@@ -78,7 +78,9 @@ class SessionStorage(context: Context) {
     private fun JsonObject.stringOr(key: String, fallback: String): String {
         val value = get(key)
         if (value == null || value.isJsonNull) return fallback
-        return runCatching { value.asString }.getOrDefault(fallback)
+        return runCatching { value.asString }
+            .getOrDefault(fallback)
+            .ifBlank { fallback }
     }
 
     private fun JsonObject.nullableString(key: String): String? {

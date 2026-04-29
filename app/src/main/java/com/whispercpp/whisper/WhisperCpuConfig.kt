@@ -6,8 +6,12 @@ import java.io.FileReader
 
 object WhisperCpuConfig {
     val preferredThreadCount: Int
-        // Fixed low thread count is safer on mobile than chasing peak throughput.
-        get() = 2
+        get() = try {
+            CpuInfo.getHighPerfCpuCount().coerceIn(2, 8)
+        } catch (e: Exception) {
+            Log.d("WhisperCpuConfig", "Couldn't determine preferred thread count", e)
+            4
+        }
 }
 
 private class CpuInfo(private val lines: List<String>) {
