@@ -34,7 +34,11 @@ struct input_stream_context {
 
 static struct whisper_context_params whisper_android_context_params(void) {
     struct whisper_context_params params = whisper_context_default_params();
+#if defined(GGML_USE_VULKAN)
     params.use_gpu = true;
+#else
+    params.use_gpu = false;
+#endif
     params.flash_attn = true;
     params.gpu_device = 0;
     return params;
@@ -170,12 +174,28 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_freeContext(
 }
 
 JNIEXPORT jint JNICALL
+Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribeRange(
+        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data,
+        jint start_sample, jint sample_count, jstring language_str);
+
+JNIEXPORT jint JNICALL
 Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
         JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data, jstring language_str) {
+    return Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribeRange(
+            env, thiz, context_ptr, num_threads, audio_data, 0,
+            (*env)->GetArrayLength(env, audio_data), language_str);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribeRange(
+        JNIEnv *env, jobject thiz, jlong context_ptr, jint num_threads, jfloatArray audio_data,
+        jint start_sample, jint sample_count, jstring language_str) {
     UNUSED(thiz);
     struct whisper_context *context = (struct whisper_context *) context_ptr;
     jfloat *audio_data_arr = (*env)->GetFloatArrayElements(env, audio_data, NULL);
     const jsize audio_data_length = (*env)->GetArrayLength(env, audio_data);
+    const int safe_start = max(0, min(start_sample, audio_data_length));
+    const int safe_count = max(0, min(sample_count, audio_data_length - safe_start));
     const char * language_chars = language_str ? (*env)->GetStringUTFChars(env, language_str, NULL) : NULL;
 
     struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -203,7 +223,7 @@ Java_com_whispercpp_whisper_WhisperLib_00024Companion_fullTranscribe(
     whisper_reset_timings(context);
 
     LOGI("About to run whisper_full");
-    int result = whisper_full(context, params, audio_data_arr, audio_data_length);
+    int result = whisper_full(context, params, audio_data_arr + safe_start, safe_count);
     if (result != 0) {
         LOGW("Failed to run the model. whisper_full returned %d", result);
     } else {

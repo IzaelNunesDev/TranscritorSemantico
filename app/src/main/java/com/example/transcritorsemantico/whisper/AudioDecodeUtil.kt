@@ -4,6 +4,7 @@ import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
@@ -11,16 +12,70 @@ import java.nio.ByteOrder
 import kotlin.math.roundToInt
 
 object AudioDecodeUtil {
+    const val WHISPER_SAMPLE_RATE = 16_000
+
+    data class Chunk(
+        val startMs: Long,
+        val endMs: Long,
+        val samples: FloatArray,
+    )
 
     fun decodeToWhisperInput(filePath: String): FloatArray {
         return if (filePath.lowercase().endsWith(".wav")) {
             decodeWav(File(filePath))
         } else {
-            decodeMedia(filePath)
+            decodeMedia(filePath, startMs = 0L, endMs = null)
         }
     }
 
-    private fun decodeMedia(filePath: String): FloatArray {
+    fun decodeToWhisperChunks(
+        filePath: String,
+        chunkMs: Long = 30_000L,
+        onChunk: (Chunk) -> Unit,
+    ): Long {
+        val durationMs = durationMs(filePath)
+        if (durationMs <= 0L || filePath.lowercase().endsWith(".wav")) {
+            val samples = decodeToWhisperInput(filePath)
+            val inferredDurationMs = ((samples.size * 1000L) / WHISPER_SAMPLE_RATE).coerceAtLeast(1L)
+            onChunk(Chunk(startMs = 0L, endMs = inferredDurationMs, samples = samples))
+            return inferredDurationMs
+        }
+
+        var startMs = 0L
+        while (startMs < durationMs) {
+            val endMs = minOf(startMs + chunkMs, durationMs)
+            val samples = decodeMedia(filePath, startMs = startMs, endMs = endMs)
+            if (samples.isNotEmpty()) {
+                onChunk(Chunk(startMs = startMs, endMs = endMs, samples = samples))
+            }
+            startMs = endMs
+        }
+        return durationMs
+    }
+
+    fun decodeToWhisperChunk(filePath: String, startMs: Long, endMs: Long): Chunk {
+        val samples = if (filePath.lowercase().endsWith(".wav")) {
+            val allSamples = decodeWav(File(filePath))
+            val startSample = ((startMs * WHISPER_SAMPLE_RATE) / 1000L).toInt().coerceIn(0, allSamples.size)
+            val endSample = ((endMs * WHISPER_SAMPLE_RATE) / 1000L).toInt().coerceIn(startSample, allSamples.size)
+            allSamples.copyOfRange(startSample, endSample)
+        } else {
+            decodeMedia(filePath, startMs = startMs, endMs = endMs)
+        }
+        return Chunk(startMs = startMs, endMs = endMs, samples = samples)
+    }
+
+    fun durationMs(filePath: String): Long {
+        return runCatching {
+            val retriever = MediaMetadataRetriever()
+            retriever.setDataSource(filePath)
+            val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            retriever.release()
+            duration?.toLongOrNull() ?: 0L
+        }.getOrDefault(0L)
+    }
+
+    private fun decodeMedia(filePath: String, startMs: Long, endMs: Long?): FloatArray {
         val extractor = MediaExtractor()
         extractor.setDataSource(filePath)
 
@@ -29,6 +84,9 @@ object AudioDecodeUtil {
         } ?: error("Nenhuma trilha de áudio encontrada no arquivo.")
 
         extractor.selectTrack(trackIndex)
+        if (startMs > 0L) {
+            extractor.seekTo(startMs * 1000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        }
         val trackFormat = extractor.getTrackFormat(trackIndex)
         val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: error("Formato de áudio inválido.")
         val decoder = MediaCodec.createDecoderByType(mime)
@@ -41,7 +99,8 @@ object AudioDecodeUtil {
         var sampleRate = trackFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         var channels = trackFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
         var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
-        val out = ArrayList<Float>(sampleRate * channels)
+        val endUs = endMs?.times(1000L)
+        val out = ArrayList<Float>((sampleRate * channels * 35).coerceAtMost(3_000_000))
 
         try {
             while (!outputDone) {
@@ -50,7 +109,8 @@ object AudioDecodeUtil {
                     if (inputBufferIndex >= 0) {
                         val inputBuffer = decoder.getInputBuffer(inputBufferIndex) ?: error("Buffer de entrada indisponível.")
                         val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                        if (sampleSize < 0) {
+                        val sampleTimeUs = extractor.sampleTime
+                        if (sampleSize < 0 || (endUs != null && sampleTimeUs >= endUs)) {
                             decoder.queueInputBuffer(
                                 inputBufferIndex,
                                 0,
@@ -154,7 +214,7 @@ object AudioDecodeUtil {
             return mono
         }
 
-        val ratio = 16_000.0 / sampleRate.toDouble()
+        val ratio = WHISPER_SAMPLE_RATE.toDouble() / sampleRate.toDouble()
         val outputSize = (mono.size * ratio).roundToInt().coerceAtLeast(1)
         return FloatArray(outputSize) { index ->
             val sourceIndex = index / ratio

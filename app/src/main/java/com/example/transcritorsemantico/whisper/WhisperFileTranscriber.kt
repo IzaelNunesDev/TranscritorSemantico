@@ -1,6 +1,8 @@
 package com.example.transcritorsemantico.whisper
 
 import android.content.Context
+import com.example.transcritorsemantico.transcription.BatchTranscriber
+import com.example.transcritorsemantico.transcription.BatchTranscriptionResult
 import com.whispercpp.whisper.WhisperContext
 import com.whispercpp.whisper.WhisperSegment
 import kotlinx.coroutines.Dispatchers
@@ -10,13 +12,8 @@ import kotlinx.coroutines.withContext
 
 class WhisperFileTranscriber(
     private val context: Context,
-) {
-    data class Result(
-        val segments: List<WhisperSegment>,
-        val speechWindowCount: Int,
-        val speechSeconds: Float,
-        val totalSeconds: Float,
-    )
+) : BatchTranscriber {
+    override val engineId: String = "whisper_cpp"
 
     private val mutex = Mutex()
     private var loadedModelPath: String? = null
@@ -27,53 +24,87 @@ class WhisperFileTranscriber(
         modelPath: String,
         language: String = "auto",
         onProgress: suspend (String) -> Unit,
-    ): Result = mutex.withLock {
-        onProgress("Lendo e convertendo áudio para 16 kHz mono...")
-        val samples = withContext(Dispatchers.IO) {
-            AudioDecodeUtil.decodeToWhisperInput(filePath)
-        }
-        val totalSeconds = samples.size / 16000f
-        onProgress("Áudio pronto. ${"%.1f".format(totalSeconds)} segundos detectados em 16 kHz mono.")
-
+    ): BatchTranscriptionResult = mutex.withLock {
         ensureContext(modelPath, onProgress)
 
-        onProgress("Rodando VAD local para isolar trechos com fala...")
-        val windows = withContext(Dispatchers.Default) {
-            WhisperVad.detectSpeechWindows(samples)
-        }
-        if (windows.isEmpty()) {
-            error("Nenhuma fala audível foi detectada no arquivo.")
-        }
-        val speechSeconds = windows.sumOf { it.lengthSamples.toLong() }.toFloat() / 16000f
-        onProgress(
-            "VAD encontrou ${windows.size} trecho(s) com fala " +
-                "em ${"%.1f".format(speechSeconds)}s de áudio útil."
-        )
-
+        onProgress("Decodificando mídia em lotes de 30s para evitar OOM...")
         val segments = mutableListOf<WhisperSegment>()
-        windows.forEachIndexed { index, window ->
-            val slice = samples.copyOfRange(window.startSample, window.endSample)
-            val chunkDurationSeconds = slice.size / 16000f
-            onProgress(
-                "Transcrevendo trecho ${index + 1}/${windows.size} " +
-                "(${String.format("%.1f", chunkDurationSeconds)}s)..."
-            )
-            val chunkSegments = whisperContext?.transcribeSegments(slice, language).orEmpty()
-            segments += chunkSegments.map {
-                it.copy(
-                    startMs = it.startMs + ((window.startSample / 16_000f) * 1000).toLong(),
-                    endMs = it.endMs + ((window.startSample / 16_000f) * 1000).toLong(),
-                )
+        var speechWindowCount = 0
+        var speechSeconds = 0f
+        var decodedChunkCount = 0
+        val totalDurationMs = withContext(Dispatchers.IO) {
+            AudioDecodeUtil.durationMs(filePath)
+        }.takeIf { it > 0L } ?: Long.MAX_VALUE
+
+        var startMs = 0L
+        var processedEndMs = 0L
+        while (startMs < totalDurationMs) {
+            val endMs = minOf(startMs + DECODE_CHUNK_MS, totalDurationMs)
+            val decoded = withContext(Dispatchers.IO) {
+                AudioDecodeUtil.decodeToWhisperChunk(filePath, startMs, endMs)
             }
+            if (decoded.samples.isEmpty()) break
+
+            decodedChunkCount += 1
+            val samples = decoded.samples
+            val windows = withContext(Dispatchers.Default) {
+                WhisperVad.detectSpeechWindows(samples)
+            }
+            speechWindowCount += windows.size
+            speechSeconds += windows.sumOf { it.lengthSamples.toLong() }.toFloat() / AudioDecodeUtil.WHISPER_SAMPLE_RATE
+
+            windows.forEachIndexed { index, window ->
+                val chunkDurationSeconds = window.lengthSamples / AudioDecodeUtil.WHISPER_SAMPLE_RATE.toFloat()
+                onProgress(
+                    "Lote $decodedChunkCount: transcrevendo fala ${index + 1}/${windows.size} " +
+                        "(${String.format("%.1f", chunkDurationSeconds)}s)..."
+                )
+                val chunkSegments = whisperContext?.transcribeSegments(
+                    data = samples,
+                    language = language,
+                    startSample = window.startSample,
+                    sampleCount = window.lengthSamples,
+                ).orEmpty()
+                val windowStartMs = ((window.startSample * 1000L) / AudioDecodeUtil.WHISPER_SAMPLE_RATE)
+                segments += chunkSegments.map {
+                    it.copy(
+                        startMs = it.startMs + decoded.startMs + windowStartMs,
+                        endMs = it.endMs + decoded.startMs + windowStartMs,
+                    )
+                }
+            }
+
+            processedEndMs = endMs
+            if (totalDurationMs == Long.MAX_VALUE && decoded.samples.size < AudioDecodeUtil.WHISPER_SAMPLE_RATE) {
+                break
+            }
+            startMs = endMs
+        }
+
+        if (segments.isEmpty()) {
+            error("Nenhuma fala audível foi detectada no arquivo.")
         }
 
         onProgress("Transcrição concluída com ${segments.size} segmentos.")
-        return Result(
+        return BatchTranscriptionResult(
             segments = segments,
-            speechWindowCount = windows.size,
+            speechWindowCount = speechWindowCount,
             speechSeconds = speechSeconds,
-            totalSeconds = totalSeconds,
+            totalSeconds = ((if (totalDurationMs == Long.MAX_VALUE) processedEndMs else totalDurationMs) / 1000f),
+            engineId = engineId,
         )
+    }
+
+    companion object {
+        private const val DECODE_CHUNK_MS = 30_000L
+    }
+
+    override suspend fun transcribeFile(
+        filePath: String,
+        language: String,
+        onProgress: suspend (String) -> Unit,
+    ): BatchTranscriptionResult {
+        error("Whisper.cpp legacy transcription needs an explicit GGML model path.")
     }
 
     private suspend fun ensureContext(

@@ -19,7 +19,7 @@ object WhisperVad {
     private const val MIN_SPEECH_MS = 240
     private const val MIN_SILENCE_MS = 320
     private const val SPEECH_PAD_MS = 180
-    private const val MAX_WINDOW_MS = 10_000
+    private const val MAX_WINDOW_MS = 30_000
     private const val MERGE_GAP_MS = 220
     private const val MIN_ABS_THRESHOLD = 0.010f
 

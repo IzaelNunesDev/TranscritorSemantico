@@ -16,7 +16,10 @@ import com.example.transcritorsemantico.data.AudioSession
 import com.example.transcritorsemantico.data.SearchHit
 import com.example.transcritorsemantico.data.SessionStorage
 import com.example.transcritorsemantico.data.TranscriptChunk
+import com.example.transcritorsemantico.litert.LiteRtModelManager
+import com.example.transcritorsemantico.litert.WhisperLiteRtTranscriber
 import com.example.transcritorsemantico.semantic.LocalSemanticEngine
+import com.example.transcritorsemantico.transcription.BatchTranscriptionResult
 import com.example.transcritorsemantico.whisper.WhisperFileTranscriber
 import com.example.transcritorsemantico.whisper.WhisperModel
 import com.example.transcritorsemantico.whisper.WhisperModelManager
@@ -44,6 +47,7 @@ data class UiState(
     val selectedEngine: TranscriptionEngine = TranscriptionEngine.ANDROID_SYSTEM,
     val selectedWhisperModel: WhisperModel = WhisperModel.BASE,
     val availableWhisperModelIds: List<String> = emptyList(),
+    val liteRtModelReady: Boolean = false,
     val whisperBusySessionId: String? = null,
     val whisperQueueCount: Int = 0,
     val whisperStatus: String = "Whisper.cpp pronto para ser configurado.",
@@ -58,6 +62,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val recorder = RecorderEngine(application)
     private val semanticEngine = LocalSemanticEngine()
     private val whisperModelManager = WhisperModelManager(application)
+    private val liteRtModelManager = LiteRtModelManager(application)
+    private val liteRtTranscriber = WhisperLiteRtTranscriber(application)
     private val whisperTranscriber = WhisperFileTranscriber(application)
 
     private var timerJob: Job? = null
@@ -78,6 +84,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             sessions = sessions,
             rankedSessionIds = sessions.map { it.id },
             availableWhisperModelIds = whisperModelManager.installedModelIds(),
+            liteRtModelReady = liteRtModelManager.hasQuickTranscriptionModel(),
+            whisperStatus = if (liteRtModelManager.hasQuickTranscriptionModel()) {
+                "LiteRT batch pronto. Whisper.cpp fica como legado/refino."
+            } else {
+                "Whisper.cpp pronto para ser configurado."
+            },
         )
     }
 
@@ -254,10 +266,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val name = queryDisplayName(uri, resolver) ?: "Arquivo importado"
             val now = System.currentTimeMillis()
             val lowerName = name.lowercase(Locale.getDefault())
+            val isLiteRtModel = lowerName.endsWith(".tflite") ||
+                lowerName.endsWith(".litert") ||
+                lowerName.endsWith(".liter")
             val isText = mime.startsWith("text/") || lowerName.endsWith(".txt") || lowerName.endsWith(".md")
             val isVideo = mime.startsWith("video/")
 
-            if (isText) {
+            if (isLiteRtModel) {
+                val modelFile = liteRtModelManager.importQuickTranscriptionModel(uri, resolver)
+                uiState = uiState.copy(
+                    liteRtModelReady = true,
+                    whisperStatus = "Modelo LiteRT instalado: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB).",
+                    message = "Modelo LiteRT instalado. Agora ele fica no armazenamento interno do app.",
+                )
+            } else if (isText) {
                 val text = resolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }.orEmpty()
                 val chunks = semanticEngine.importChunksFromPlainText(text)
                 val session = AudioSession(
@@ -295,6 +317,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }.onFailure {
             uiState = uiState.copy(message = "Nao consegui importar este arquivo.")
+        }
+    }
+
+    fun importLiteRtModel(uri: Uri, resolver: ContentResolver) {
+        runCatching {
+            val modelFile = liteRtModelManager.importQuickTranscriptionModel(uri, resolver)
+            uiState = uiState.copy(
+                liteRtModelReady = true,
+                whisperStatus = "Modelo LiteRT instalado: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB).",
+                message = "Modelo LiteRT instalado. Agora ele fica no armazenamento interno do app.",
+            )
+        }.onFailure {
+            uiState = uiState.copy(message = "Nao consegui importar este modelo LiteRT.")
         }
     }
 
@@ -347,21 +382,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             session.copy(
                 status = "queued",
                 transcriptionEngine = session.safeTranscriptionEngine("pending"),
-                note = "Arquivo aguardando na fila Whisper para transcrição offline.",
+                note = if (uiState.liteRtModelReady) {
+                    "Arquivo aguardando na fila LiteRT batch para transcrição offline."
+                } else {
+                    "Arquivo aguardando na fila Whisper para transcrição offline."
+                },
                 updatedAt = System.currentTimeMillis(),
             )
         )
         uiState = uiState.copy(
             whisperQueueCount = pendingWhisperQueue.size,
             whisperStatus = if (uiState.whisperBusySessionId == null) {
-                "Sessão adicionada à fila Whisper. Preparando transcrição offline..."
+                "Sessão adicionada à fila batch. Preparando transcrição offline..."
             } else {
-                "Sessão adicionada à fila Whisper. ${pendingWhisperQueue.size} item(ns) aguardando."
+                "Sessão adicionada à fila batch. ${pendingWhisperQueue.size} item(ns) aguardando."
             },
             message = if (uiState.whisperBusySessionId == null) {
-                "Sessão enviada para transcrição Whisper."
+                "Sessão enviada para transcrição batch."
             } else {
-                "Sessão adicionada à fila Whisper."
+                "Sessão adicionada à fila batch."
             },
         )
         processNextWhisperJob()
@@ -379,38 +418,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val session = uiState.sessions.firstOrNull { it.id == nextSessionId }
                     ?: error("Sessão removida antes de iniciar a transcrição.")
+                val useLiteRt = liteRtModelManager.hasQuickTranscriptionModel()
 
                 replaceSession(
                     session.copy(
                         status = "transcribing",
                         transcriptionEngine = session.safeTranscriptionEngine("pending"),
-                        note = "Transcrevendo offline com whisper.cpp e VAD local.",
+                        note = if (useLiteRt) {
+                            "Transcrevendo offline com LiteRT batch. Whisper.cpp fica como fallback legado."
+                        } else {
+                            "Transcrevendo offline com whisper.cpp e VAD local."
+                        },
                         updatedAt = System.currentTimeMillis(),
                     )
                 )
                 uiState = uiState.copy(
+                    liteRtModelReady = useLiteRt,
                     whisperBusySessionId = nextSessionId,
                     whisperQueueCount = pendingWhisperQueue.size,
-                    whisperStatus = "Preparando modelo ${model.title} para ${session.title}...",
+                    whisperStatus = if (useLiteRt) {
+                        "Preparando LiteRT batch para ${session.title}..."
+                    } else {
+                        "Preparando modelo ${model.title} para ${session.title}..."
+                    },
                 )
 
                 val localAudioFile = ensureLocalAudioFile(session) { progress ->
                     uiState = uiState.copy(whisperStatus = progress)
                 }
-                val modelFile = whisperModelManager.ensureModel(model) { progress ->
-                    uiState = uiState.copy(whisperStatus = progress)
-                }
-                uiState = uiState.copy(
-                    availableWhisperModelIds = whisperModelManager.installedModelIds(),
-                    whisperStatus = "Modelo pronto. Iniciando pipeline VAD + Whisper...",
-                )
 
-                val result = whisperTranscriber.transcribeFile(
-                    filePath = localAudioFile.absolutePath,
-                    modelPath = modelFile.absolutePath,
-                    language = preferredWhisperLanguage(),
-                ) { progress ->
-                    uiState = uiState.copy(whisperStatus = progress)
+                var usedEngineId = ""
+                var usedEngineLabel = ""
+                val result: BatchTranscriptionResult = if (useLiteRt) {
+                    runCatching {
+                        uiState = uiState.copy(whisperStatus = "Iniciando LiteRT CompiledModel NPU > GPU > CPU...")
+                        liteRtTranscriber.transcribeFile(
+                            filePath = localAudioFile.absolutePath,
+                            language = preferredWhisperLanguage(),
+                        ) { progress ->
+                            uiState = uiState.copy(whisperStatus = progress)
+                        }
+                    }.onSuccess {
+                        usedEngineId = it.engineId
+                        usedEngineLabel = "LiteRT Whisper"
+                    }.getOrElse { liteRtError ->
+                        val detail = liteRtError.message ?: "LiteRT ainda não concluiu esta transcrição."
+                        uiState = uiState.copy(
+                            whisperStatus = "LiteRT disponível, mas o decoder ainda não terminou: $detail Usando whisper.cpp legado.",
+                        )
+                        transcribeWithWhisperCpp(localAudioFile, model) { progress ->
+                            uiState = uiState.copy(whisperStatus = progress)
+                        }.also {
+                            usedEngineId = "whisper_cpp:${model.id}"
+                            usedEngineLabel = "Whisper ${model.title}"
+                        }
+                    }
+                } else {
+                    transcribeWithWhisperCpp(localAudioFile, model) { progress ->
+                        uiState = uiState.copy(whisperStatus = progress)
+                    }.also {
+                        usedEngineId = "whisper_cpp:${model.id}"
+                        usedEngineLabel = "Whisper ${model.title}"
+                    }
                 }
 
                 val chunks = result.segments.map { segment ->
@@ -423,8 +492,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 replaceSession(
                     session.copy(
                         status = "indexed",
-                        transcriptionEngine = "whisper_cpp:${model.id}",
-                        note = "Transcrito com ${model.title}. VAD encontrou ${result.speechWindowCount} trecho(s) com fala em ${"%.1f".format(result.speechSeconds)}s úteis.",
+                        transcriptionEngine = usedEngineId,
+                        note = "Transcrito com $usedEngineLabel. VAD encontrou ${result.speechWindowCount} trecho(s) com fala em ${"%.1f".format(result.speechSeconds)}s úteis.",
                         audioPath = localAudioFile.absolutePath,
                         chunks = chunks,
                         updatedAt = System.currentTimeMillis(),
@@ -432,7 +501,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 uiState = uiState.copy(
                     whisperStatus = "Transcrição concluída. ${chunks.size} trechos indexados para ${session.title}.",
-                    message = "Sessão transcrita com Whisper e pronta para busca semântica.",
+                    message = "Sessão transcrita com $usedEngineLabel e pronta para busca semântica.",
                 )
             } catch (error: Throwable) {
                 val detail = error.message ?: "Falha ao transcrever com Whisper."
@@ -459,6 +528,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 processNextWhisperJob()
             }
         }
+    }
+
+    private suspend fun transcribeWithWhisperCpp(
+        localAudioFile: File,
+        model: WhisperModel,
+        onProgress: suspend (String) -> Unit,
+    ): BatchTranscriptionResult {
+        val modelFile = whisperModelManager.ensureModel(model, onProgress)
+        uiState = uiState.copy(
+            availableWhisperModelIds = whisperModelManager.installedModelIds(),
+            whisperStatus = "Modelo pronto. Iniciando pipeline VAD + Whisper legado...",
+        )
+        return whisperTranscriber.transcribeFile(
+            filePath = localAudioFile.absolutePath,
+            modelPath = modelFile.absolutePath,
+            language = preferredWhisperLanguage(),
+            onProgress = onProgress,
+        )
     }
 
     private suspend fun ensureLocalAudioFile(

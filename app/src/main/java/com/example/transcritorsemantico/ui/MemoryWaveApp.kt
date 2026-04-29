@@ -109,6 +109,13 @@ fun MemoryWaveApp(
             viewModel.importDocument(uri, context.contentResolver)
         }
     }
+    val modelImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importLiteRtModel(uri, context.contentResolver)
+        }
+    }
 
     LaunchedEffect(uiState.message) {
         uiState.message?.let {
@@ -143,6 +150,7 @@ fun MemoryWaveApp(
                     onEngineSelected = viewModel::setTranscriptionEngine,
                     selectedWhisperModel = uiState.selectedWhisperModel,
                     availableWhisperModelIds = uiState.availableWhisperModelIds,
+                    liteRtModelReady = uiState.liteRtModelReady,
                     whisperQueueCount = uiState.whisperQueueCount,
                     whisperStatus = uiState.whisperStatus,
                     onWhisperModelSelected = viewModel::setWhisperModel,
@@ -157,6 +165,9 @@ fun MemoryWaveApp(
                     },
                     onSecondary = {
                         importLauncher.launch("*/*")
+                    },
+                    onImportModel = {
+                        modelImportLauncher.launch("*/*")
                     },
                     onCreateNote = {
                         noteDialogOpen = true
@@ -216,6 +227,7 @@ fun MemoryWaveApp(
             SessionDetailDialog(
                 session = selectedSession,
                 selectedWhisperModel = uiState.selectedWhisperModel,
+                liteRtModelReady = uiState.liteRtModelReady,
                 whisperStatus = uiState.whisperStatus,
                 whisperBusy = uiState.whisperBusySessionId == selectedSession.id,
                 onTranscribeWithWhisper = { viewModel.transcribeSessionWithWhisper(selectedSession.id) },
@@ -245,11 +257,13 @@ private fun HeroCard(
     onEngineSelected: (TranscriptionEngine) -> Unit,
     selectedWhisperModel: WhisperModel,
     availableWhisperModelIds: List<String>,
+    liteRtModelReady: Boolean,
     whisperQueueCount: Int,
     whisperStatus: String,
     onWhisperModelSelected: (WhisperModel) -> Unit,
     onPrimary: () -> Unit,
     onSecondary: () -> Unit,
+    onImportModel: () -> Unit,
     onCreateNote: () -> Unit,
 ) {
     val gradient = if (isRecording) {
@@ -303,6 +317,9 @@ private fun HeroCard(
                     MetricChip(label = if (isRecording) "Sessao em curso" else "Pronto para gravar")
                     MetricChip(label = "TurboMSE 4-bit")
                     MetricChip(label = "Busca semantica local")
+                    if (liteRtModelReady) {
+                        MetricChip(label = "LiteRT batch pronto")
+                    }
                 }
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -337,7 +354,11 @@ private fun HeroCard(
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Whisper.cpp por arquivo",
+                        text = if (liteRtModelReady) {
+                            "LiteRT batch + Whisper legado"
+                        } else {
+                            "Whisper.cpp por arquivo"
+                        },
                         style = MaterialTheme.typography.labelLarge,
                         color = Color.White,
                     )
@@ -362,7 +383,7 @@ private fun HeroCard(
                         }
                     }
                     if (whisperQueueCount > 0) {
-                        MetricChip(label = "Fila Whisper $whisperQueueCount")
+                        MetricChip(label = "Fila batch $whisperQueueCount")
                     }
                     Text(
                         text = whisperStatus,
@@ -437,6 +458,17 @@ private fun HeroCard(
                         Spacer(modifier = Modifier.size(8.dp))
                         Text("Importar arquivo")
                     }
+                }
+
+                OutlinedButton(
+                    onClick = onImportModel,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color.White,
+                    ),
+                ) {
+                    Icon(Icons.Rounded.Album, contentDescription = null)
+                    Spacer(modifier = Modifier.size(8.dp))
+                    Text(if (liteRtModelReady) "Trocar modelo LiteRT" else "Importar modelo LiteRT")
                 }
 
                 OutlinedButton(
@@ -901,6 +933,7 @@ private fun SessionBadge(status: String) {
 private fun SessionDetailDialog(
     session: AudioSession,
     selectedWhisperModel: WhisperModel,
+    liteRtModelReady: Boolean,
     whisperStatus: String,
     whisperBusy: Boolean,
     onTranscribeWithWhisper: () -> Unit,
@@ -1003,7 +1036,11 @@ private fun SessionDetailDialog(
                                     verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
                                     Text(
-                                        text = "Whisper.cpp selecionado: ${selectedWhisperModel.title}",
+                                        text = if (liteRtModelReady) {
+                                            "LiteRT batch instalado; Whisper ${selectedWhisperModel.title} fica como legado"
+                                        } else {
+                                            "Whisper.cpp selecionado: ${selectedWhisperModel.title}"
+                                        },
                                         style = MaterialTheme.typography.labelLarge,
                                         color = MaterialTheme.colorScheme.onSecondaryContainer,
                                     )
@@ -1020,13 +1057,13 @@ private fun SessionDetailDialog(
                                             if (whisperBusy) {
                                                 "Transcrevendo..."
                                             } else if (session.status == "queued") {
-                                                "Na fila Whisper"
+                                                "Na fila batch"
                                             } else if (session.status == "transcribing") {
                                                 "Processando áudio"
                                             } else if (session.status == "indexed") {
-                                                "Retrancrever com Whisper"
+                                                if (liteRtModelReady) "Retranscrever com LiteRT" else "Retranscrever com Whisper"
                                             } else {
-                                                "Transcrever com Whisper"
+                                                if (liteRtModelReady) "Transcrever com LiteRT" else "Transcrever com Whisper"
                                             }
                                         )
                                     }

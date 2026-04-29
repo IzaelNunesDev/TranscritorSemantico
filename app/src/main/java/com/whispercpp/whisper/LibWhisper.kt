@@ -51,10 +51,13 @@ class WhisperContext private constructor(private var ptr: Long) {
     suspend fun transcribeSegments(
         data: FloatArray,
         language: String = "auto",
+        startSample: Int = 0,
+        sampleCount: Int = data.size - startSample,
     ): List<WhisperSegment> = withContext(scope.coroutineContext) {
         require(ptr != 0L)
         val numThreads = WhisperCpuConfig.preferredThreadCount
-        val status = WhisperLib.fullTranscribe(ptr, numThreads, data, language)
+        Log.d(LOG_TAG, "Transcribing $sampleCount samples from $startSample with $numThreads threads")
+        val status = WhisperLib.fullTranscribeRange(ptr, numThreads, data, startSample, sampleCount, language)
         if (status != 0) {
             throw IllegalStateException("whisper.cpp falhou ao transcrever (codigo $status).")
         }
@@ -133,8 +136,14 @@ private class WhisperLib {
     companion object {
         init {
             Log.d(LOG_TAG, "Primary ABI: ${Build.SUPPORTED_ABIS[0]}")
-            Log.d(LOG_TAG, "Loading generic libwhisper.so for stability on mobile")
-            System.loadLibrary("whisper")
+            val preferred = if (isArmEabiV8a()) "whisper_v8fp16_va" else "whisper"
+            runCatching {
+                Log.d(LOG_TAG, "Loading optimized $preferred")
+                System.loadLibrary(preferred)
+            }.onFailure {
+                Log.w(LOG_TAG, "Optimized library unavailable, falling back to generic whisper", it)
+                System.loadLibrary("whisper")
+            }
         }
 
         // JNI methods
@@ -143,6 +152,14 @@ private class WhisperLib {
         external fun initContext(modelPath: String): Long
         external fun freeContext(contextPtr: Long)
         external fun fullTranscribe(contextPtr: Long, numThreads: Int, audioData: FloatArray, language: String): Int
+        external fun fullTranscribeRange(
+            contextPtr: Long,
+            numThreads: Int,
+            audioData: FloatArray,
+            startSample: Int,
+            sampleCount: Int,
+            language: String,
+        ): Int
         external fun getTextSegmentCount(contextPtr: Long): Int
         external fun getTextSegment(contextPtr: Long, index: Int): String
         external fun getTextSegmentT0(contextPtr: Long, index: Int): Long
