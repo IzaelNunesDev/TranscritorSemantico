@@ -32,7 +32,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val viewModel: MainViewModel = viewModel()
-            TranscritorSemanticoTheme {
+            TranscritorSemanticoTheme(darkTheme = true) {
                 MemoryWaveApp(
                     viewModel = viewModel,
                     micGranted = micGranted,

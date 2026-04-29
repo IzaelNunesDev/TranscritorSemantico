@@ -16,9 +16,9 @@ private val DarkColorScheme = darkColorScheme(
     onBackground = Color(0xFFEAF4F8),
     surface = DeepSurface,
     onSurface = Color(0xFFEAF4F8),
-    surfaceContainerHigh = Color(0xFF163040),
+    surfaceContainerHigh = Color(0xFF173142),
     onSurfaceVariant = Color(0xFFA9C2CC),
-    secondaryContainer = Color(0xFF20485B),
+    secondaryContainer = Color(0xFF23495C),
     onSecondaryContainer = Color(0xFFD8F5F7),
 )
 
@@ -33,9 +33,9 @@ private val LightColorScheme = lightColorScheme(
     surface = Color.White,
     onSurface = InkNight,
     surfaceContainerHigh = WarmCloud,
-    onSurfaceVariant = Color(0xFF51626D),
-    secondaryContainer = Color(0xFFD5F5F4),
-    onSecondaryContainer = Color(0xFF083337),
+    onSurfaceVariant = Graphite.copy(alpha = 0.72f),
+    secondaryContainer = IcePanel,
+    onSecondaryContainer = Color(0xFF11344A),
 )
 
 @Composable

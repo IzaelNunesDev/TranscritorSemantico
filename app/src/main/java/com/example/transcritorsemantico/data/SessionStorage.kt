@@ -55,6 +55,8 @@ class SessionStorage(context: Context) {
             transcriptionEngine = obj.stringOr("transcriptionEngine", "android_system"),
             note = obj.nullableString("note"),
             chunks = obj.chunksOrEmpty(),
+            liteRtTranscript = obj.variantOrNull("liteRtTranscript"),
+            legacyTurboTranscript = obj.variantOrNull("legacyTurboTranscript"),
         )
     }
 
@@ -75,6 +77,23 @@ class SessionStorage(context: Context) {
         }
     }
 
+    private fun JsonObject.variantOrNull(key: String): TranscriptVariant? {
+        val obj = get(key) as? JsonObject ?: return null
+        val engineId = obj.stringOr("engineId", "")
+        val label = obj.stringOr("label", "")
+        if (engineId.isBlank() || label.isBlank()) return null
+        return TranscriptVariant(
+            engineId = engineId,
+            label = label,
+            createdAt = obj.longOr("createdAt", 0L),
+            speechWindowCount = obj.intOr("speechWindowCount", 0),
+            speechSeconds = obj.floatOr("speechSeconds", 0f),
+            totalSeconds = obj.floatOr("totalSeconds", 0f),
+            text = obj.stringOr("text", ""),
+            chunks = obj.chunksOrEmpty(),
+        )
+    }
+
     private fun JsonObject.stringOr(key: String, fallback: String): String {
         val value = get(key)
         if (value == null || value.isJsonNull) return fallback
@@ -93,5 +112,17 @@ class SessionStorage(context: Context) {
         val value = get(key)
         if (value == null || value.isJsonNull) return fallback
         return runCatching { value.asLong }.getOrDefault(fallback)
+    }
+
+    private fun JsonObject.intOr(key: String, fallback: Int): Int {
+        val value = get(key)
+        if (value == null || value.isJsonNull) return fallback
+        return runCatching { value.asInt }.getOrDefault(fallback)
+    }
+
+    private fun JsonObject.floatOr(key: String, fallback: Float): Float {
+        val value = get(key)
+        if (value == null || value.isJsonNull) return fallback
+        return runCatching { value.asFloat }.getOrDefault(fallback)
     }
 }

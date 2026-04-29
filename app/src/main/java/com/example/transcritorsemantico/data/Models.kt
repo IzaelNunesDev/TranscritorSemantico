@@ -8,6 +8,17 @@ data class TranscriptChunk(
     val packedEmbedding: String,
 )
 
+data class TranscriptVariant(
+    val engineId: String,
+    val label: String,
+    val createdAt: Long,
+    val speechWindowCount: Int = 0,
+    val speechSeconds: Float = 0f,
+    val totalSeconds: Float = 0f,
+    val text: String = "",
+    val chunks: List<TranscriptChunk> = emptyList(),
+)
+
 data class AudioSession(
     val id: String,
     val title: String,
@@ -20,6 +31,8 @@ data class AudioSession(
     val transcriptionEngine: String = "android_system",
     val note: String? = null,
     val chunks: List<TranscriptChunk> = emptyList(),
+    val liteRtTranscript: TranscriptVariant? = null,
+    val legacyTurboTranscript: TranscriptVariant? = null,
 )
 
 data class SearchHit(

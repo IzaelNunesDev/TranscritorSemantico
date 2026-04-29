@@ -1,6 +1,7 @@
 package com.example.transcritorsemantico.litert
 
 import android.content.Context
+import android.util.Log
 import com.example.transcritorsemantico.transcription.BatchTranscriber
 import com.example.transcritorsemantico.transcription.BatchTranscriptionResult
 import com.example.transcritorsemantico.whisper.AudioDecodeUtil
@@ -33,6 +34,7 @@ class WhisperLiteRtTranscriber(
     private val mutex = Mutex()
     private var environment: Environment? = null
     private var compiledModel: CompiledModel? = null
+    private var compiledModelFile: File? = null
     private var tokenDecoder: LiteRtTokenDecoder? = null
 
     override val engineId: String = "litert_whisper"
@@ -42,7 +44,9 @@ class WhisperLiteRtTranscriber(
         language: String,
         onProgress: suspend (String) -> Unit,
     ): BatchTranscriptionResult = mutex.withLock {
+        Log.i(LOG_TAG, "Starting LiteRT transcription for file=$filePath language=$language ${modelManager.describeQuickModel()}")
         if (!modelManager.hasQuickTranscriptionModel()) {
+            Log.w(LOG_TAG, "LiteRT requested without installed model. ${modelManager.describeQuickModel()}")
             error(
                 "LiteRT ainda não tem ${LiteRtModelManager.QUICK_WHISPER_MODEL_NAME}. " +
                     "Coloque o modelo em ${modelManager.quickTranscriptionModel.parentFile?.absolutePath}."
@@ -51,8 +55,9 @@ class WhisperLiteRtTranscriber(
 
         val model = ensureCompiledModel(onProgress)
         val decoder = ensureTokenDecoder(context)
+        val modelName = compiledModelFile?.name ?: LiteRtModelManager.QUICK_WHISPER_MODEL_NAME
         onProgress(
-            "LiteRT compilou ${LiteRtModelManager.QUICK_WHISPER_MODEL_NAME}. " +
+            "LiteRT compilou $modelName. " +
                 "Decodificando mídia em lotes de 30s..."
         )
 
@@ -72,11 +77,16 @@ class WhisperLiteRtTranscriber(
                 AudioDecodeUtil.decodeToWhisperChunk(filePath, startMs, endMs)
             }
             if (decoded.samples.isEmpty()) break
+            Log.d(
+                LOG_TAG,
+                "LiteRT decoded chunk=$decodedChunkCount startMs=$startMs endMs=$endMs sampleCount=${decoded.samples.size}"
+            )
 
             decodedChunkCount += 1
             val windows = withContext(Dispatchers.Default) {
                 WhisperVad.detectSpeechWindows(decoded.samples)
             }
+            Log.d(LOG_TAG, "LiteRT VAD windows=${windows.size} for chunk=$decodedChunkCount")
             speechWindowCount += windows.size
             speechSeconds += windows.sumOf { it.lengthSamples.toLong() }.toFloat() / AudioDecodeUtil.WHISPER_SAMPLE_RATE
 
@@ -87,26 +97,23 @@ class WhisperLiteRtTranscriber(
                         "(${String.format("%.1f", chunkDurationSeconds)}s)..."
                 )
                 val samples = decoded.samples.copyOfRange(window.startSample, window.endSample)
-                val inputFeatures = model.createInputBuffer(SIGNATURE_TRANSCRIBE, INPUT_FEATURES)
-                val sequences = model.createOutputBuffer(SIGNATURE_TRANSCRIBE, OUTPUT_SEQUENCES)
-                withContext(Dispatchers.Default) {
-                    inputFeatures.writeFloat(WhisperLogMel.compute(samples, melBins = 80, frames = 3000))
+                val inputFeatureValues = withContext(Dispatchers.Default) {
+                    WhisperLogMel.compute(samples, melBins = 80, frames = 3000)
                 }
-                model.run(
-                    mapOf(INPUT_FEATURES to inputFeatures),
-                    mapOf(OUTPUT_SEQUENCES to sequences),
-                    SIGNATURE_TRANSCRIBE,
-                )
-                val text = decoder.decode(listOf(sequences)).trim()
+                val inference = runWhisperSignature(model, inputFeatureValues)
+                val text = decoder.decode(listOf(inference.output)).trim()
                 if (text.isNotBlank()) {
+                    Log.d(LOG_TAG, "LiteRT segment accepted length=${text.length} chunk=$decodedChunkCount window=${index + 1}")
                     val windowStartMs = ((window.startSample * 1000L) / AudioDecodeUtil.WHISPER_SAMPLE_RATE)
                     segments += WhisperSegment(
                         startMs = decoded.startMs + windowStartMs,
                         endMs = decoded.startMs + windowStartMs + ((samples.size * 1000L) / AudioDecodeUtil.WHISPER_SAMPLE_RATE),
                         text = text,
                     )
+                } else {
+                    Log.w(LOG_TAG, "LiteRT returned blank text for chunk=$decodedChunkCount window=${index + 1}")
                 }
-                onProgress("LiteRT executou serving_transcribe com input_features 1x80x3000.")
+                onProgress("LiteRT executou ${inference.signature} com input_features 1x80x3000.")
             }
 
             processedEndMs = endMs
@@ -121,6 +128,10 @@ class WhisperLiteRtTranscriber(
         }
 
         onProgress("Transcrição LiteRT concluída com ${segments.size} segmentos.")
+        Log.i(
+            LOG_TAG,
+            "LiteRT transcription finished for file=$filePath segments=${segments.size} windows=$speechWindowCount speechSeconds=$speechSeconds"
+        )
         return BatchTranscriptionResult(
             segments = segments,
             speechWindowCount = speechWindowCount,
@@ -133,11 +144,56 @@ class WhisperLiteRtTranscriber(
     private suspend fun ensureCompiledModel(onProgress: suspend (String) -> Unit): CompiledModel {
         compiledModel?.let { return it }
 
-        onProgress("Inicializando LiteRT e escolhendo acelerador NPU > GPU > CPU...")
+        onProgress("Inicializando LiteRT e testando modelos/aceleradores...")
         val env = environment ?: Environment.create().also { environment = it }
-        val options = CompiledModel.Options(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
-        return CompiledModel.create(modelManager.quickTranscriptionModel.absolutePath, options, env)
-            .also { compiledModel = it }
+        val failures = mutableListOf<String>()
+        val accelerators = listOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
+        modelManager.transcriptionModelCandidates().forEach { modelFile ->
+            accelerators.forEach { accelerator ->
+                val options = CompiledModel.Options(accelerator)
+                val compiled = runCatching {
+                    onProgress("Compilando ${modelFile.name} com $accelerator...")
+                    CompiledModel.create(modelFile.absolutePath, options, env)
+                }.onFailure { error ->
+                    val message = error.message ?: error::class.java.simpleName
+                    failures += "${modelFile.name}/$accelerator: $message"
+                    Log.w(LOG_TAG, "LiteRT compile failed for model=${modelFile.name} accelerator=$accelerator", error)
+                }.getOrNull()
+                if (compiled != null) {
+                    compiledModel = compiled
+                    compiledModelFile = modelFile
+                    Log.i(LOG_TAG, "LiteRT compiled model=${modelFile.name} accelerator=$accelerator")
+                    return compiled
+                }
+            }
+        }
+        error("LiteRT nao conseguiu compilar nenhum modelo disponivel. ${failures.joinToString(" | ")}")
+    }
+
+    private fun runWhisperSignature(
+        model: CompiledModel,
+        inputFeatureValues: FloatArray,
+    ): LiteRtInferenceResult {
+        val failures = mutableListOf<String>()
+        WHISPER_SIGNATURES.forEach { signature ->
+            val result = runCatching {
+                val inputFeatures = model.createInputBuffer(signature, INPUT_FEATURES)
+                val sequences = model.createOutputBuffer(signature, OUTPUT_SEQUENCES)
+                inputFeatures.writeFloat(inputFeatureValues)
+                model.run(
+                    mapOf(INPUT_FEATURES to inputFeatures),
+                    mapOf(OUTPUT_SEQUENCES to sequences),
+                    signature,
+                )
+                LiteRtInferenceResult(signature = signature, output = sequences)
+            }.onFailure { error ->
+                val message = error.message ?: error::class.java.simpleName
+                failures += "$signature: $message"
+                Log.w(LOG_TAG, "LiteRT signature failed: $signature", error)
+            }.getOrNull()
+            if (result != null) return result
+        }
+        error("LiteRT compilou o modelo, mas nenhuma assinatura de inferencia funcionou. ${failures.joinToString(" | ")}")
     }
 
     private fun ensureTokenDecoder(context: Context): LiteRtTokenDecoder {
@@ -151,17 +207,31 @@ class WhisperLiteRtTranscriber(
     fun close() {
         compiledModel?.close()
         compiledModel = null
+        compiledModelFile = null
         environment?.close()
         environment = null
     }
 
     companion object {
+        private const val LOG_TAG = "WhisperLiteRt"
         private const val SIGNATURE_TRANSCRIBE = "serving_transcribe"
+        private const val SIGNATURE_DEFAULT = "serving_default"
+        private const val SIGNATURE_TRANSLATE = "serving_translate"
         private const val INPUT_FEATURES = "input_features"
         private const val OUTPUT_SEQUENCES = "sequences"
         private const val DECODE_CHUNK_MS = 30_000L
+        private val WHISPER_SIGNATURES = listOf(
+            SIGNATURE_TRANSCRIBE,
+            SIGNATURE_DEFAULT,
+            SIGNATURE_TRANSLATE,
+        )
     }
 }
+
+private data class LiteRtInferenceResult(
+    val signature: String,
+    val output: TensorBuffer,
+)
 
 private object WhisperLogMel {
     private const val SAMPLE_RATE = AudioDecodeUtil.WHISPER_SAMPLE_RATE

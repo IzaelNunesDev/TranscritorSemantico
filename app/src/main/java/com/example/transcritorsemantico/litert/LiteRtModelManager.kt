@@ -3,6 +3,7 @@ package com.example.transcritorsemantico.litert
 import android.content.Context
 import android.net.Uri
 import android.content.ContentResolver
+import android.util.Log
 import java.io.File
 
 class LiteRtModelManager(private val context: Context) {
@@ -13,23 +14,42 @@ class LiteRtModelManager(private val context: Context) {
             modelDir.mkdirs()
         }
         ensureModelInFilesDir()
+        Log.i(LOG_TAG, "LiteRT model manager initialized: ${describeQuickModel()}")
     }
 
     val quickTranscriptionModel: File
         get() = File(modelDir, QUICK_WHISPER_MODEL_NAME)
 
     fun hasQuickTranscriptionModel(): Boolean {
-        return quickTranscriptionModel.exists() && quickTranscriptionModel.length() > 0L
+        return transcriptionModelCandidates().isNotEmpty()
+    }
+
+    fun transcriptionModelCandidates(): List<File> {
+        return BUNDLED_MODEL_NAMES
+            .map { File(modelDir, it) }
+            .filter { it.exists() && it.length() > 0L }
+    }
+
+    fun describeQuickModel(): String {
+        val candidates = transcriptionModelCandidates().joinToString { file ->
+            "${file.name}:${file.length()}"
+        }
+        return "installed=${hasQuickTranscriptionModel()} candidates=[$candidates] dir=${modelDir.absolutePath}"
     }
 
     private fun ensureModelInFilesDir() {
-        if (!hasQuickTranscriptionModel()) {
-            // Tenta copiar dos assets se existir
-            runCatching {
-                context.assets.open("models/$QUICK_WHISPER_MODEL_NAME").use { input ->
-                    quickTranscriptionModel.outputStream().use { output ->
-                        input.copyTo(output)
+        BUNDLED_MODEL_NAMES.forEach { assetName ->
+            val target = File(modelDir, assetName)
+            if (!target.exists() || target.length() <= 0L) {
+                runCatching {
+                    context.assets.open("models/$assetName").use { input ->
+                        target.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
                     }
+                    Log.i(LOG_TAG, "LiteRT model copied from assets/$assetName to ${target.absolutePath}")
+                }.onFailure {
+                    Log.d(LOG_TAG, "LiteRT model assets/$assetName was not found during bootstrap.", it)
                 }
             }
         }
@@ -55,10 +75,16 @@ class LiteRtModelManager(private val context: Context) {
             temp.copyTo(quickTranscriptionModel, overwrite = true)
             temp.delete()
         }
+        Log.i(LOG_TAG, "LiteRT model imported by user: ${describeQuickModel()}")
         return quickTranscriptionModel
     }
 
     companion object {
+        private const val LOG_TAG = "LiteRtModelManager"
         const val QUICK_WHISPER_MODEL_NAME = "whisper-base-transcribe-translate.tflite"
+        private val BUNDLED_MODEL_NAMES = listOf(
+            QUICK_WHISPER_MODEL_NAME,
+            "whisper-base.pt.tflite",
+        )
     }
 }
