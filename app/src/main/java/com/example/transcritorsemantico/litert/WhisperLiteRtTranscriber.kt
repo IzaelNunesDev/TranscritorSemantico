@@ -9,11 +9,13 @@ import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.TensorBuffer
 import com.google.ai.edge.litert.Environment
+import com.google.gson.JsonParser
 import com.whispercpp.whisper.WhisperSegment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.math.PI
 import kotlin.math.cos
@@ -83,13 +85,17 @@ class WhisperLiteRtTranscriber(
                         "(${String.format("%.1f", chunkDurationSeconds)}s)..."
                 )
                 val samples = decoded.samples.copyOfRange(window.startSample, window.endSample)
-                val inputBuffers = model.createInputBuffers(SIGNATURE_TRANSCRIBE)
-                val outputBuffers = model.createOutputBuffers(SIGNATURE_TRANSCRIBE)
-                val prepared = withContext(Dispatchers.Default) {
-                    LiteRtWhisperInput.prepare(samples, inputBuffers)
+                val inputFeatures = model.createInputBuffer(SIGNATURE_TRANSCRIBE, INPUT_FEATURES)
+                val sequences = model.createOutputBuffer(SIGNATURE_TRANSCRIBE, OUTPUT_SEQUENCES)
+                withContext(Dispatchers.Default) {
+                    inputFeatures.writeFloat(WhisperLogMel.compute(samples, melBins = 80, frames = 3000))
                 }
-                model.run(inputBuffers, outputBuffers, SIGNATURE_TRANSCRIBE)
-                val text = decoder.decode(outputBuffers).trim()
+                model.run(
+                    mapOf(INPUT_FEATURES to inputFeatures),
+                    mapOf(OUTPUT_SEQUENCES to sequences),
+                    SIGNATURE_TRANSCRIBE,
+                )
+                val text = decoder.decode(listOf(sequences)).trim()
                 if (text.isNotBlank()) {
                     val windowStartMs = ((window.startSample * 1000L) / AudioDecodeUtil.WHISPER_SAMPLE_RATE)
                     segments += WhisperSegment(
@@ -98,7 +104,7 @@ class WhisperLiteRtTranscriber(
                         text = text,
                     )
                 }
-                onProgress("LiteRT aceitou entrada $prepared para serving_transcribe.")
+                onProgress("LiteRT executou serving_transcribe com input_features 1x80x3000.")
             }
 
             processedEndMs = endMs
@@ -148,43 +154,9 @@ class WhisperLiteRtTranscriber(
 
     companion object {
         private const val SIGNATURE_TRANSCRIBE = "serving_transcribe"
+        private const val INPUT_FEATURES = "input_features"
+        private const val OUTPUT_SEQUENCES = "sequences"
         private const val DECODE_CHUNK_MS = 30_000L
-    }
-}
-
-private object LiteRtWhisperInput {
-    private const val WHISPER_WINDOW_SAMPLES = 30 * AudioDecodeUtil.WHISPER_SAMPLE_RATE
-
-    fun prepare(samples: FloatArray, inputBuffers: List<TensorBuffer>): String {
-        require(inputBuffers.isNotEmpty()) { "O modelo LiteRT não expôs entradas para serving_transcribe." }
-        val first = inputBuffers.first()
-        val attempts = listOf(
-            "pcm_30s" to { padOrTrim(samples, WHISPER_WINDOW_SAMPLES) },
-            "log_mel_80x3000" to { WhisperLogMel.compute(samples, melBins = 80, frames = 3000) },
-            "log_mel_128x3000" to { WhisperLogMel.compute(samples, melBins = 128, frames = 3000) },
-            "pcm_window" to { samples },
-        )
-        val accepted = attempts.firstOrNull { (_, tensor) ->
-            runCatching { first.writeFloat(tensor()) }.isSuccess
-        } ?: error(
-            "Não consegui preencher a primeira entrada do serving_transcribe. " +
-                "Tentei PCM 30s, log-mel 80x3000, log-mel 128x3000 e PCM do trecho."
-        )
-
-        inputBuffers.drop(1).forEach { buffer ->
-            runCatching { buffer.writeInt(intArrayOf(0)) }
-                .recoverCatching { buffer.writeLong(longArrayOf(0L)) }
-                .recoverCatching { buffer.writeFloat(floatArrayOf(0f)) }
-                .recoverCatching { buffer.writeBoolean(booleanArrayOf(false)) }
-                .getOrElse {
-                    error("O modelo tem entradas extras em serving_transcribe que precisam de metadados específicos.")
-                }
-        }
-        return accepted.first
-    }
-
-    private fun padOrTrim(samples: FloatArray, size: Int): FloatArray {
-        return FloatArray(size) { index -> samples.getOrElse(index) { 0f } }
     }
 }
 
@@ -201,7 +173,7 @@ private object WhisperLogMel {
             (0.5 - 0.5 * cos((2.0 * PI * index) / FFT_SIZE)).toFloat()
         }
         val filters = melFilters(melBins)
-        val output = FloatArray(melBins * frames)
+        val raw = FloatArray(melBins * frames)
         val power = FloatArray((FFT_SIZE / 2) + 1)
 
         for (frame in 0 until frames) {
@@ -213,10 +185,14 @@ private object WhisperLogMel {
                 for (bin in power.indices) {
                     energy += power[bin] * filter[bin]
                 }
-                output[(mel * frames) + frame] = normalizeLogMel(energy)
+                raw[(mel * frames) + frame] = (ln(max(energy, 1e-10f)) / ln(10f))
             }
         }
-        return output
+
+        val topDbFloor = (raw.maxOrNull() ?: 0f) - 8f
+        return FloatArray(raw.size) { index ->
+            ((max(raw[index], topDbFloor) + 4f) / 4f)
+        }
     }
 
     private fun powerSpectrum(samples: FloatArray, offset: Int, window: FloatArray, out: FloatArray) {
@@ -258,11 +234,6 @@ private object WhisperLogMel {
         }
     }
 
-    private fun normalizeLogMel(energy: Float): Float {
-        val log10 = ln(max(energy, 1e-10f)) / ln(10f)
-        return ((log10 + 4f) / 4f).coerceIn(-1.5f, 1.5f)
-    }
-
     private fun hzToMel(hz: Float): Float = 2595f * (ln(1f + hz / 700f) / ln(10f))
 
     private fun melToHz(mel: Float): Float = 700f * (10f.pow(mel / 2595f) - 1f)
@@ -272,6 +243,7 @@ private class LiteRtTokenDecoder(
     filesDir: File,
 ) {
     private val idToToken: Map<Int, String> = loadVocabulary(filesDir)
+    private val byteDecoder: Map<Char, Int> = whisperByteDecoder()
 
     fun decode(outputBuffers: List<TensorBuffer>): String {
         outputBuffers.forEach { buffer ->
@@ -319,15 +291,13 @@ private class LiteRtTokenDecoder(
 
     private fun decodeIds(ids: Iterable<Int>): String? {
         if (idToToken.isEmpty()) return null
-        val text = ids
+        val tokenText = ids
             .takeWhile { it != 50256 }
             .filter { it >= 0 }
             .mapNotNull { idToToken[it] }
             .filterNot { it.startsWith("<|") && it.endsWith("|>") }
             .joinToString("")
-            .replace("Ġ", " ")
-            .replace("▁", " ")
-            .trim()
+        val text = decodeWhisperTokenText(tokenText).trim()
         return text.takeIf { it.isNotBlank() }
     }
 
@@ -361,27 +331,51 @@ private class LiteRtTokenDecoder(
     }
 
     private fun parseJsonVocabulary(json: String): Map<Int, String> {
-        val pairs = Regex("\"((?:\\\\.|[^\"])*)\"\\s*:\\s*(\"(?:\\\\.|[^\"])*\"|-?\\d+)")
-            .findAll(json)
-            .mapNotNull { match ->
-                val key = unescapeJson(match.groupValues[1])
-                val value = match.groupValues[2]
-                val idFromKey = key.toIntOrNull()
-                if (idFromKey != null) {
-                    idFromKey to unescapeJson(value.trim('"'))
-                } else {
-                    value.toIntOrNull()?.let { it to key }
+        val root = JsonParser.parseString(json)
+        if (!root.isJsonObject) return emptyMap()
+        return root.asJsonObject.entrySet().mapNotNull { (key, value) ->
+            val idFromKey = key.toIntOrNull()
+            if (idFromKey != null) {
+                when {
+                    value.isJsonPrimitive && value.asJsonPrimitive.isString -> idFromKey to value.asString
+                    else -> null
                 }
+            } else if (value.isJsonPrimitive && value.asJsonPrimitive.isNumber) {
+                value.asInt to key
+            } else {
+                null
             }
-            .toMap()
-        return pairs
+        }.toMap()
     }
 
-    private fun unescapeJson(value: String): String {
-        return value
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
+    private fun decodeWhisperTokenText(tokenText: String): String {
+        val bytes = ByteArrayOutputStream(tokenText.length)
+        tokenText.forEach { char ->
+            val byte = byteDecoder[char]
+            if (byte != null) {
+                bytes.write(byte)
+            } else {
+                bytes.write(char.toString().toByteArray(Charsets.UTF_8))
+            }
+        }
+        return bytes.toByteArray().toString(Charsets.UTF_8)
+    }
+
+    private fun whisperByteDecoder(): Map<Char, Int> {
+        val bytes = mutableListOf<Int>()
+        bytes += 33..126
+        bytes += 161..172
+        bytes += 174..255
+
+        val chars = bytes.toMutableList()
+        var extra = 0
+        for (byte in 0..255) {
+            if (byte !in bytes) {
+                bytes += byte
+                chars += 256 + extra
+                extra += 1
+            }
+        }
+        return chars.map { it.toChar() }.zip(bytes).toMap()
     }
 }
