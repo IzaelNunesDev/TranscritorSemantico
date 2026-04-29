@@ -1,0 +1,69 @@
+# Gradle
+.gradle/
+/build/
+*/build/
+
+# IntelliJ IDEA / Android Studio
+.idea/
+*.iml
+*.iws
+*.ipr
+/out/
+captures/
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+
+# Android Specific
+.externalNativeBuild/
+.cxx/
+local.properties
+*.keystore
+*.jks
+*.ap_
+*.apk
+*.dex
+/captures
+
+# Kotlin
+.kotlin/
+*.class
+
+# Native/NDK
+obj/
+lib/
+
+# Python (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+tmp/
+*.bak
+*.swp
+*~
+
+# AI/ML Models
+*.bin
+*.onnx
+*.tflite
+*.pt
+*.pth
+*.weights
+*.h5
+
+# Local config and secrets
+.env
+.env.local
+.env.*.local
+secrets.xml
+google-services.json
