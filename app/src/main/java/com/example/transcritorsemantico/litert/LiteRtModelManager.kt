@@ -5,13 +5,14 @@ import android.net.Uri
 import android.content.ContentResolver
 import java.io.File
 
-class LiteRtModelManager(context: Context) {
+class LiteRtModelManager(private val context: Context) {
     private val modelDir = File(context.filesDir, "memorywave/litert-models")
 
     init {
         if (!modelDir.exists()) {
             modelDir.mkdirs()
         }
+        ensureModelInFilesDir()
     }
 
     val quickTranscriptionModel: File
@@ -19,6 +20,19 @@ class LiteRtModelManager(context: Context) {
 
     fun hasQuickTranscriptionModel(): Boolean {
         return quickTranscriptionModel.exists() && quickTranscriptionModel.length() > 0L
+    }
+
+    private fun ensureModelInFilesDir() {
+        if (!hasQuickTranscriptionModel()) {
+            // Tenta copiar dos assets se existir
+            runCatching {
+                context.assets.open("models/$QUICK_WHISPER_MODEL_NAME").use { input ->
+                    quickTranscriptionModel.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+        }
     }
 
     fun importQuickTranscriptionModel(uri: Uri, resolver: ContentResolver): File {
@@ -45,6 +59,6 @@ class LiteRtModelManager(context: Context) {
     }
 
     companion object {
-        const val QUICK_WHISPER_MODEL_NAME = "whisper-base.tflite"
+        const val QUICK_WHISPER_MODEL_NAME = "whisper-base-transcribe-translate.tflite"
     }
 }

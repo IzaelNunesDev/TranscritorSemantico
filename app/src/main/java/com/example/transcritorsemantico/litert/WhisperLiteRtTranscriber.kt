@@ -17,6 +17,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.ObjectInputStream
+import java.util.HashMap
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
@@ -48,7 +50,7 @@ class WhisperLiteRtTranscriber(
         }
 
         val model = ensureCompiledModel(onProgress)
-        val decoder = ensureTokenDecoder()
+        val decoder = ensureTokenDecoder(context)
         onProgress(
             "LiteRT compilou ${LiteRtModelManager.QUICK_WHISPER_MODEL_NAME}. " +
                 "Decodificando mídia em lotes de 30s..."
@@ -138,9 +140,10 @@ class WhisperLiteRtTranscriber(
             .also { compiledModel = it }
     }
 
-    private fun ensureTokenDecoder(): LiteRtTokenDecoder {
+    private fun ensureTokenDecoder(context: Context): LiteRtTokenDecoder {
         tokenDecoder?.let { return it }
         return LiteRtTokenDecoder(
+            context = context,
             filesDir = modelManager.quickTranscriptionModel.parentFile ?: context.filesDir,
         ).also { tokenDecoder = it }
     }
@@ -240,9 +243,10 @@ private object WhisperLogMel {
 }
 
 private class LiteRtTokenDecoder(
+    context: Context,
     filesDir: File,
 ) {
-    private val idToToken: Map<Int, String> = loadVocabulary(filesDir)
+    private val idToToken: Map<Int, String> = loadVocabulary(context, filesDir)
     private val byteDecoder: Map<Char, Int> = whisperByteDecoder()
 
     fun decode(outputBuffers: List<TensorBuffer>): String {
@@ -301,7 +305,25 @@ private class LiteRtTokenDecoder(
         return text.takeIf { it.isNotBlank() }
     }
 
-    private fun loadVocabulary(filesDir: File): Map<Int, String> {
+    private fun loadVocabulary(context: Context, filesDir: File): Map<Int, String> {
+        // 1. Tentar carregar do .bin otimizado nos assets (recomendado pelo DocWolle)
+        val vocabFiles = listOf(
+            "models/filters_vocab_multilingual.bin",
+            "models/filters_vocab_en.bin"
+        )
+        for (vocabPath in vocabFiles) {
+            runCatching {
+                context.assets.open(vocabPath).use { input ->
+                    ObjectInputStream(input).use { ois ->
+                        @Suppress("UNCHECKED_CAST")
+                        val map = ois.readObject() as HashMap<Int, ByteArray>
+                        return map.mapValues { String(it.value, Charsets.UTF_8) }
+                    }
+                }
+            }.getOrNull()?.let { return it }
+        }
+
+        // 2. Fallback para arquivos no sistema de arquivos (legado)
         val file = listOf(
             "whisper-vocab.txt",
             "vocab.txt",

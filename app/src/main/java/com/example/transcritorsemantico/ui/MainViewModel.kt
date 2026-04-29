@@ -76,19 +76,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
 
     init {
-        val sessions = storage.loadSessions().sortedByDescending { it.updatedAt }
-        if (sessions.isNotEmpty()) {
-            storage.saveSessions(sessions)
+        val rawSessions = storage.loadSessions()
+        // Reset stuck sessions (transcribing/queued) to needs_transcription
+        val cleanedSessions = rawSessions.map { session ->
+            if (session.status == "transcribing" || session.status == "queued") {
+                session.copy(
+                    status = "needs_transcription",
+                    note = "Transcrição interrompida (app reiniciado). Clique para tentar novamente."
+                )
+            } else {
+                session
+            }
+        }.sortedByDescending { it.updatedAt }
+
+        if (cleanedSessions.isNotEmpty()) {
+            storage.saveSessions(cleanedSessions)
         }
+
         uiState = uiState.copy(
-            sessions = sessions,
-            rankedSessionIds = sessions.map { it.id },
+            sessions = cleanedSessions,
+            rankedSessionIds = cleanedSessions.map { it.id },
             availableWhisperModelIds = whisperModelManager.installedModelIds(),
             liteRtModelReady = liteRtModelManager.hasQuickTranscriptionModel(),
             whisperStatus = if (liteRtModelManager.hasQuickTranscriptionModel()) {
-                "LiteRT batch pronto. Whisper.cpp fica como legado/refino."
+                "LiteRT Batch pronto (Otimizado). Whisper.cpp fica como fallback."
             } else {
-                "Whisper.cpp pronto para ser configurado."
+                "Whisper.cpp pronto (Legado). Importe um modelo LiteRT para mais velocidade."
             },
         )
     }
@@ -460,17 +473,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }.onSuccess {
                         usedEngineId = it.engineId
-                        usedEngineLabel = "LiteRT Whisper"
+                        usedEngineLabel = "LiteRT Batch"
                     }.getOrElse { liteRtError ->
                         val detail = liteRtError.message ?: "LiteRT ainda não concluiu esta transcrição."
                         uiState = uiState.copy(
-                            whisperStatus = "LiteRT disponível, mas o decoder ainda não terminou: $detail Usando whisper.cpp legado.",
+                            whisperStatus = "LiteRT falhou, usando Whisper.cpp legado: $detail",
                         )
                         transcribeWithWhisperCpp(localAudioFile, model) { progress ->
                             uiState = uiState.copy(whisperStatus = progress)
                         }.also {
                             usedEngineId = "whisper_cpp:${model.id}"
-                            usedEngineLabel = "Whisper ${model.title}"
+                            usedEngineLabel = "Whisper ${model.title} (Legado)"
                         }
                     }
                 } else {
@@ -478,7 +491,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         uiState = uiState.copy(whisperStatus = progress)
                     }.also {
                         usedEngineId = "whisper_cpp:${model.id}"
-                        usedEngineLabel = "Whisper ${model.title}"
+                        usedEngineLabel = "Whisper ${model.title} (Legado)"
                     }
                 }
 

@@ -18,10 +18,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
@@ -953,7 +955,10 @@ private fun SessionDetailDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
-            TextButton(onClick = onDismiss) {
+            Button(
+                onClick = onDismiss,
+                shape = RoundedCornerShape(14.dp)
+            ) {
                 Text("Fechar")
             }
         },
@@ -968,7 +973,10 @@ private fun SessionDetailDialog(
             }
         },
         text = {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            LazyColumn(
+                modifier = Modifier.heightIn(max = 450.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 item {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1027,43 +1035,92 @@ private fun SessionDetailDialog(
                                 )
                             }
 
-                            Surface(
-                                color = MaterialTheme.colorScheme.secondaryContainer,
-                                shape = RoundedCornerShape(18.dp),
+                            // Engine Status and Action Card
+                            Card(
+                                shape = RoundedCornerShape(20.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+                                ),
+                                border = if (whisperBusy) {
+                                    androidx.compose.foundation.BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+                                } else null,
                             ) {
                                 Column(
-                                    modifier = Modifier.padding(14.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.padding(16.dp),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    Text(
-                                        text = if (liteRtModelReady) {
-                                            "LiteRT batch instalado; Whisper ${selectedWhisperModel.title} fica como legado"
-                                        } else {
-                                            "Whisper.cpp selecionado: ${selectedWhisperModel.title}"
-                                        },
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                    )
-                                    Text(
-                                        text = whisperStatus,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                    )
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(40.dp)
+                                                .clip(CircleShape)
+                                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                imageVector = if (liteRtModelReady) Icons.Rounded.GraphicEq else Icons.Rounded.Album,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                        Column {
+                                            Text(
+                                                text = if (liteRtModelReady) "Motor: LiteRT Batch (Otimizado)" else "Motor: Whisper.cpp (Legado)",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Text(
+                                                text = if (liteRtModelReady) "Processamento NPU/GPU de alta velocidade." else "Processamento padrão via CPU.",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                                            )
+                                        }
+                                    }
+
+                                    if (whisperStatus.isNotBlank()) {
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.5f),
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text(
+                                                text = whisperStatus,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                modifier = Modifier.padding(10.dp),
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+
                                     Button(
                                         onClick = onTranscribeWithWhisper,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(16.dp),
                                         enabled = !whisperBusy && session.status != "queued" && session.status != "transcribing",
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (session.status == "indexed") MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary
+                                        )
                                     ) {
+                                        Icon(
+                                            imageVector = if (session.status == "indexed") Icons.Rounded.GraphicEq else Icons.Rounded.PlayCircle,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(Modifier.width(8.dp))
                                         Text(
                                             if (whisperBusy) {
-                                                "Transcrevendo..."
+                                                "Processando agora..."
                                             } else if (session.status == "queued") {
-                                                "Na fila batch"
+                                                "Na fila de espera"
                                             } else if (session.status == "transcribing") {
-                                                "Processando áudio"
+                                                "Transcrevendo áudio..."
                                             } else if (session.status == "indexed") {
-                                                if (liteRtModelReady) "Retranscrever com LiteRT" else "Retranscrever com Whisper"
+                                                if (liteRtModelReady) "Retranscrever (LiteRT Batch)" else "Retranscrever (Whisper Legado)"
                                             } else {
-                                                if (liteRtModelReady) "Transcrever com LiteRT" else "Transcrever com Whisper"
+                                                if (liteRtModelReady) "Transcrever (LiteRT Batch)" else "Transcrever (Whisper Legado)"
                                             }
                                         )
                                     }
@@ -1077,7 +1134,7 @@ private fun SessionDetailDialog(
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(18.dp))
+                            .clip(RoundedCornerShape(16.dp))
                             .clickable {
                                 currentSeek = chunk.startMs
                                 val mediaPlayer = player ?: createPlayer(context, session.audioPath.orEmpty())?.also {
@@ -1087,20 +1144,24 @@ private fun SessionDetailDialog(
                                 mediaPlayer?.start()
                                 isPlaying = mediaPlayer != null
                             },
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
                     ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            verticalAlignment = Alignment.Top
                         ) {
                             Text(
                                 text = formatDuration(chunk.startMs),
-                                style = MaterialTheme.typography.labelLarge,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(top = 2.dp)
                             )
                             Text(
                                 text = chunk.text,
                                 style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
                             )
                         }
                     }
