@@ -67,3 +67,24 @@ tmp/
 .env.*.local
 secrets.xml
 google-services.json
+
+# Whisper.cpp specific
+third_party/whisper.cpp/build/
+third_party/whisper.cpp/build-*/
+third_party/whisper.cpp/build_*/
+third_party/whisper.cpp/.cache/
+third_party/whisper.cpp/.coreml/
+third_party/whisper.cpp/.test/
+third_party/whisper.cpp/.venv/
+third_party/whisper.cpp/.vs/
+third_party/whisper.cpp/.vscode/
+third_party/whisper.cpp/talk-llama.dSYM/
+third_party/whisper.cpp/main
+third_party/whisper.cpp/stream
+third_party/whisper.cpp/command
+third_party/whisper.cpp/talk
+third_party/whisper.cpp/talk-llama
+third_party/whisper.cpp/bench
+third_party/whisper.cpp/quantize
+third_party/whisper.cpp/server
+third_party/whisper.cpp/lsp
