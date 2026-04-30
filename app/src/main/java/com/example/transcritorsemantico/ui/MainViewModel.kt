@@ -304,13 +304,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val now = System.currentTimeMillis()
             val lowerName = name.lowercase(Locale.getDefault())
             val isLiteRtModel = lowerName.endsWith(".tflite") ||
+                lowerName.endsWith(".litertlm") ||
                 lowerName.endsWith(".litert") ||
                 lowerName.endsWith(".liter")
             val isText = mime.startsWith("text/") || lowerName.endsWith(".txt") || lowerName.endsWith(".md")
             val isVideo = mime.startsWith("video/")
 
             if (isLiteRtModel) {
-                val modelFile = liteRtModelManager.importQuickTranscriptionModel(uri, resolver)
+                val modelFile = liteRtModelManager.importQuickTranscriptionModel(uri, resolver, name)
                 refreshLiteRtAvailability("modelo importado")
                 uiState = uiState.copy(
                     whisperStatus = "Modelo LiteRT instalado: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB).",
@@ -360,7 +361,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importLiteRtModel(uri: Uri, resolver: ContentResolver) {
         runCatching {
-            val modelFile = liteRtModelManager.importQuickTranscriptionModel(uri, resolver)
+            val displayName = queryDisplayName(uri, resolver)
+            val modelFile = liteRtModelManager.importQuickTranscriptionModel(uri, resolver, displayName)
             refreshLiteRtAvailability("modelo importado manualmente")
             uiState = uiState.copy(
                 whisperStatus = "Modelo LiteRT instalado: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB).",
@@ -880,6 +882,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "MainViewModel"
-        private const val TRANSCRIPTION_TIMEOUT_MS = 120_000L
+        private const val TRANSCRIPTION_TIMEOUT_MS = 900_000L
     }
 }

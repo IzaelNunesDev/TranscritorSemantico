@@ -525,7 +525,7 @@ private fun HeroActions(
                 contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
             ) {
-                Text("Importar LiteRT")
+                Text("Importar IA")
             }
         }
     }
@@ -846,7 +846,7 @@ private fun ModelSettingsPanel(
                     contentColor = Color.White,
                 ),
             ) {
-                Text(if (uiState.liteRtModelReady) "Trocar modelo LiteRT" else "Importar modelo LiteRT")
+                Text(if (uiState.liteRtModelReady) "Trocar modelo LiteRT/Gemma" else "Importar modelo LiteRT/Gemma")
             }
         }
         DarkPanel {
@@ -1432,7 +1432,7 @@ private fun SessionDetailDialog(
                                             Text(
                                                 if (!liteRtModelReady) "LiteRT indisponivel"
                                                 else if (whisperBusy) "Processando"
-                                                else "Transcrever com LiteRT"
+                                                else "Transcrever com LiteRT/Gemma"
                                             )
                                         }
                                         FilledTonalButton(

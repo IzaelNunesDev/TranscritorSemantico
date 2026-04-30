@@ -6,10 +6,6 @@ import com.example.transcritorsemantico.transcription.BatchTranscriber
 import com.example.transcritorsemantico.transcription.BatchTranscriptionResult
 import com.example.transcritorsemantico.whisper.AudioDecodeUtil
 import com.example.transcritorsemantico.whisper.WhisperVad
-import com.google.ai.edge.litert.Accelerator
-import com.google.ai.edge.litert.CompiledModel
-import com.google.ai.edge.litert.TensorBuffer
-import com.google.ai.edge.litert.Environment
 import com.google.gson.JsonParser
 import com.whispercpp.whisper.WhisperSegment
 import kotlinx.coroutines.Dispatchers
@@ -18,24 +14,29 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.ObjectInputStream
-import java.util.HashMap
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import org.tensorflow.lite.DataType
+import org.tensorflow.lite.Interpreter
 
 class WhisperLiteRtTranscriber(
     private val context: Context,
 ) : BatchTranscriber {
     private val modelManager = LiteRtModelManager(context)
     private val mutex = Mutex()
-    private var environment: Environment? = null
-    private var compiledModel: CompiledModel? = null
-    private var compiledModelFile: File? = null
+    private var interpreter: Interpreter? = null
+    private var interpreterModelFile: File? = null
     private var tokenDecoder: LiteRtTokenDecoder? = null
+    private var gemmaAudioTranscriber: GemmaAudioLiteRtLmTranscriber? = null
+    private val docWolleMelFilters: LiteRtMelFilters? by lazy {
+        loadDocWolleMelFilters(context)
+    }
 
     override val engineId: String = "litert_whisper"
 
@@ -48,16 +49,24 @@ class WhisperLiteRtTranscriber(
         if (!modelManager.hasQuickTranscriptionModel()) {
             Log.w(LOG_TAG, "LiteRT requested without installed model. ${modelManager.describeQuickModel()}")
             error(
-                "LiteRT ainda não tem ${LiteRtModelManager.QUICK_WHISPER_MODEL_NAME}. " +
+                "LiteRT ainda não tem modelo de transcrição. " +
                     "Coloque o modelo em ${modelManager.quickTranscriptionModel.parentFile?.absolutePath}."
             )
         }
 
-        val model = ensureCompiledModel(onProgress)
+        val preferredModel = modelManager.preferredTranscriptionModel()
+        if (preferredModel?.extension.equals("litertlm", ignoreCase = true)) {
+            Log.i(LOG_TAG, "Delegating LiteRT transcription to LiteRT-LM audio model=${preferredModel?.name}")
+            return (gemmaAudioTranscriber ?: GemmaAudioLiteRtLmTranscriber(context, modelManager).also {
+                gemmaAudioTranscriber = it
+            }).transcribeFile(filePath, language, onProgress)
+        }
+
+        val model = ensureInterpreter(onProgress)
         val decoder = ensureTokenDecoder(context)
-        val modelName = compiledModelFile?.name ?: LiteRtModelManager.QUICK_WHISPER_MODEL_NAME
+        val modelName = interpreterModelFile?.name ?: LiteRtModelManager.QUICK_WHISPER_MODEL_NAME
         onProgress(
-            "LiteRT compilou $modelName. " +
+            "LiteRT carregou $modelName. " +
                 "Decodificando mídia em lotes de 30s..."
         )
 
@@ -97,13 +106,23 @@ class WhisperLiteRtTranscriber(
                         "(${String.format("%.1f", chunkDurationSeconds)}s)..."
                 )
                 val samples = decoded.samples.copyOfRange(window.startSample, window.endSample)
+                val melStartedAt = System.currentTimeMillis()
                 val inputFeatureValues = withContext(Dispatchers.Default) {
-                    WhisperLogMel.compute(samples, melBins = 80, frames = 3000)
+                    WhisperLogMel.compute(samples, filters = docWolleMelFilters, frames = 3000)
                 }
-                val inference = runWhisperSignature(model, inputFeatureValues)
-                val text = decoder.decode(listOf(inference.output)).trim()
+                val melElapsedMs = System.currentTimeMillis() - melStartedAt
+                val inferenceStartedAt = System.currentTimeMillis()
+                val inference = withContext(Dispatchers.Default) {
+                    runWhisperSignature(model, inputFeatureValues)
+                }
+                val inferenceElapsedMs = System.currentTimeMillis() - inferenceStartedAt
+                val text = decoder.decode(inference.signature, listOf(inference.output)).trim()
                 if (text.isNotBlank()) {
-                    Log.d(LOG_TAG, "LiteRT segment accepted length=${text.length} chunk=$decodedChunkCount window=${index + 1}")
+                    Log.d(
+                        LOG_TAG,
+                        "LiteRT segment accepted length=${text.length} chunk=$decodedChunkCount " +
+                            "window=${index + 1} melMs=$melElapsedMs inferenceMs=$inferenceElapsedMs"
+                    )
                     val windowStartMs = ((window.startSample * 1000L) / AudioDecodeUtil.WHISPER_SAMPLE_RATE)
                     segments += WhisperSegment(
                         startMs = decoded.startMs + windowStartMs,
@@ -111,7 +130,11 @@ class WhisperLiteRtTranscriber(
                         text = text,
                     )
                 } else {
-                    Log.w(LOG_TAG, "LiteRT returned blank text for chunk=$decodedChunkCount window=${index + 1}")
+                    Log.w(
+                        LOG_TAG,
+                        "LiteRT returned blank text for chunk=$decodedChunkCount window=${index + 1} " +
+                            "melMs=$melElapsedMs inferenceMs=$inferenceElapsedMs"
+                    )
                 }
                 onProgress("LiteRT executou ${inference.signature} com input_features 1x80x3000.")
             }
@@ -141,59 +164,119 @@ class WhisperLiteRtTranscriber(
         )
     }
 
-    private suspend fun ensureCompiledModel(onProgress: suspend (String) -> Unit): CompiledModel {
-        compiledModel?.let { return it }
+    private suspend fun ensureInterpreter(onProgress: suspend (String) -> Unit): Interpreter {
+        interpreter?.let { return it }
 
-        onProgress("Inicializando LiteRT e testando modelos/aceleradores...")
-        val env = environment ?: Environment.create().also { environment = it }
+        onProgress("Inicializando LiteRT Interpreter para modelo DocWolle...")
         val failures = mutableListOf<String>()
-        val accelerators = listOf(Accelerator.NPU, Accelerator.GPU, Accelerator.CPU)
-        modelManager.transcriptionModelCandidates().forEach { modelFile ->
-            accelerators.forEach { accelerator ->
-                val options = CompiledModel.Options(accelerator)
-                val compiled = runCatching {
-                    onProgress("Compilando ${modelFile.name} com $accelerator...")
-                    CompiledModel.create(modelFile.absolutePath, options, env)
+        modelManager.transcriptionModelCandidates()
+            .filter { it.extension.equals("tflite", ignoreCase = true) }
+            .forEach { modelFile ->
+                val loaded = runCatching {
+                    onProgress("Carregando ${modelFile.name} com Interpreter.runSignature...")
+                    Interpreter(modelFile, Interpreter.Options().apply {
+                        setNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(2, 6))
+                    })
                 }.onFailure { error ->
                     val message = error.message ?: error::class.java.simpleName
-                    failures += "${modelFile.name}/$accelerator: $message"
-                    Log.w(LOG_TAG, "LiteRT compile failed for model=${modelFile.name} accelerator=$accelerator", error)
+                    failures += "${modelFile.name}: $message"
+                    Log.w(LOG_TAG, "LiteRT Interpreter load failed for model=${modelFile.name}", error)
                 }.getOrNull()
-                if (compiled != null) {
-                    compiledModel = compiled
-                    compiledModelFile = modelFile
-                    Log.i(LOG_TAG, "LiteRT compiled model=${modelFile.name} accelerator=$accelerator")
-                    return compiled
+                if (loaded != null) {
+                    interpreter = loaded
+                    interpreterModelFile = modelFile
+                    Log.i(
+                        LOG_TAG,
+                        "LiteRT Interpreter loaded model=${modelFile.name} signatures=${loaded.getSignatureKeys().joinToString()}"
+                    )
+                    return loaded
                 }
             }
-        }
-        error("LiteRT nao conseguiu compilar nenhum modelo disponivel. ${failures.joinToString(" | ")}")
+        error("LiteRT nao conseguiu carregar nenhum modelo DocWolle .tflite. ${failures.joinToString(" | ")}")
     }
 
     private fun runWhisperSignature(
-        model: CompiledModel,
+        model: Interpreter,
         inputFeatureValues: FloatArray,
     ): LiteRtInferenceResult {
         val failures = mutableListOf<String>()
-        WHISPER_SIGNATURES.forEach { signature ->
+        val availableSignatures = runCatching { model.getSignatureKeys().toSet() }.getOrDefault(emptySet())
+        Log.d(LOG_TAG, "DocWolle signatures available=${availableSignatures.joinToString()}")
+        val signaturesToTry = when {
+            SIGNATURE_TRANSCRIBE in availableSignatures -> listOf(SIGNATURE_TRANSCRIBE)
+            SIGNATURE_DEFAULT in availableSignatures -> listOf(SIGNATURE_DEFAULT)
+            else -> WHISPER_SIGNATURES
+        }
+        for (signature in signaturesToTry) {
+            if (signature !in availableSignatures) {
+                failures += "$signature: assinatura ausente em ${availableSignatures.joinToString()}"
+                continue
+            }
             val result = runCatching {
-                val inputFeatures = model.createInputBuffer(signature, INPUT_FEATURES)
-                val sequences = model.createOutputBuffer(signature, OUTPUT_SEQUENCES)
-                inputFeatures.writeFloat(inputFeatureValues)
-                model.run(
-                    mapOf(INPUT_FEATURES to inputFeatures),
-                    mapOf(OUTPUT_SEQUENCES to sequences),
+                val output = createSignatureOutput(model, signature)
+                model.runSignature(
+                    mapOf(INPUT_FEATURES to inputFeatureTensor(inputFeatureValues)),
+                    mapOf(OUTPUT_SEQUENCES to output),
                     signature,
                 )
-                LiteRtInferenceResult(signature = signature, output = sequences)
+                Log.i(LOG_TAG, "LiteRT successfully ran signature=$signature")
+                LiteRtInferenceResult(signature = signature, output = output)
             }.onFailure { error ->
                 val message = error.message ?: error::class.java.simpleName
                 failures += "$signature: $message"
                 Log.w(LOG_TAG, "LiteRT signature failed: $signature", error)
+                if (signature == SIGNATURE_TRANSCRIBE && isFatalWhisperGenerateError(message)) {
+                    error(
+                        "Modelo DocWolle falhou dentro de serving_transcribe ($message). " +
+                            "Nao tentei serving_default/translate porque isso costuma repetir o WHILE do generate " +
+                            "e travar ate o timeout."
+                    )
+                }
             }.getOrNull()
+
             if (result != null) return result
         }
-        error("LiteRT compilou o modelo, mas nenhuma assinatura de inferencia funcionou. ${failures.joinToString(" | ")}")
+
+        error(
+            "Modelo DocWolle LiteRT carregado, mas nenhuma assinatura de transcricao funcionou. " +
+                failures.joinToString(" | ")
+        )
+    }
+
+    private fun inputFeatureTensor(values: FloatArray): Array<Array<FloatArray>> {
+        require(values.size == 80 * 3000) {
+            "input_features precisa ter 80x3000 floats, mas veio ${values.size}"
+        }
+        var offset = 0
+        return Array(1) {
+            Array(80) {
+                FloatArray(3000) { values[offset++] }
+            }
+        }
+    }
+
+    private fun isFatalWhisperGenerateError(message: String): Boolean {
+        return message.contains("gather index out of bounds", ignoreCase = true) ||
+            message.contains("WHILE", ignoreCase = true)
+    }
+
+    private fun createSignatureOutput(model: Interpreter, signature: String): Any {
+        val tensor = model.getOutputTensorFromSignature(OUTPUT_SEQUENCES, signature)
+        val shape = tensor.shape().map { if (it <= 0) MAX_OUTPUT_TOKENS else it }
+        val batch = shape.getOrNull(0)?.coerceAtLeast(1) ?: 1
+        val tokens = shape.getOrNull(1)?.coerceAtLeast(1) ?: MAX_OUTPUT_TOKENS
+        Log.d(
+            LOG_TAG,
+            "DocWolle output tensor signature=$signature name=${tensor.name()} type=${tensor.dataType()} " +
+                "shape=${tensor.shape().joinToString()} shapeSignature=${tensor.shapeSignature().joinToString()}"
+        )
+        return when (tensor.dataType()) {
+            DataType.INT64 -> Array(batch) { LongArray(tokens) }
+            DataType.INT32 -> Array(batch) { IntArray(tokens) }
+            DataType.FLOAT32 -> Array(batch) { FloatArray(tokens) }
+            else -> ByteBuffer.allocateDirect(tensor.numBytes().coerceAtLeast(batch * tokens * Int.SIZE_BYTES))
+                .order(ByteOrder.nativeOrder())
+        }
     }
 
     private fun ensureTokenDecoder(context: Context): LiteRtTokenDecoder {
@@ -205,11 +288,11 @@ class WhisperLiteRtTranscriber(
     }
 
     fun close() {
-        compiledModel?.close()
-        compiledModel = null
-        compiledModelFile = null
-        environment?.close()
-        environment = null
+        interpreter?.close()
+        interpreter = null
+        interpreterModelFile = null
+        gemmaAudioTranscriber?.close()
+        gemmaAudioTranscriber = null
     }
 
     companion object {
@@ -220,6 +303,7 @@ class WhisperLiteRtTranscriber(
         private const val INPUT_FEATURES = "input_features"
         private const val OUTPUT_SEQUENCES = "sequences"
         private const val DECODE_CHUNK_MS = 30_000L
+        private const val MAX_OUTPUT_TOKENS = 512
         private val WHISPER_SIGNATURES = listOf(
             SIGNATURE_TRANSCRIBE,
             SIGNATURE_DEFAULT,
@@ -230,8 +314,35 @@ class WhisperLiteRtTranscriber(
 
 private data class LiteRtInferenceResult(
     val signature: String,
-    val output: TensorBuffer,
+    val output: Any,
 )
+
+private data class LiteRtMelFilters(
+    val nMel: Int,
+    val nFft: Int,
+    val rows: Array<FloatArray>,
+)
+
+private fun loadDocWolleMelFilters(context: Context): LiteRtMelFilters? {
+    return runCatching {
+        val bytes = context.assets.open("models/filters_vocab_multilingual.bin").use { it.readBytes() }
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val magic = buffer.int
+        if (magic != 0x5553454e) return@runCatching null
+        val nMel = buffer.int
+        val nFft = buffer.int
+        require(nMel > 0 && nFft > 0)
+        val rows = Array(nMel) {
+            FloatArray(nFft) {
+                buffer.float
+            }
+        }
+        Log.i("WhisperLiteRt", "Loaded DocWolle mel filters nMel=$nMel nFft=$nFft")
+        LiteRtMelFilters(nMel = nMel, nFft = nFft, rows = rows)
+    }.onFailure { error ->
+        Log.w("WhisperLiteRt", "Failed to load DocWolle mel filters, falling back to generated filters", error)
+    }.getOrNull()
+}
 
 private object WhisperLogMel {
     private const val SAMPLE_RATE = AudioDecodeUtil.WHISPER_SAMPLE_RATE
@@ -240,22 +351,26 @@ private object WhisperLogMel {
     private const val MEL_MIN_HZ = 0f
     private const val MEL_MAX_HZ = 8000f
 
-    fun compute(samples: FloatArray, melBins: Int, frames: Int): FloatArray {
+    fun compute(samples: FloatArray, filters: LiteRtMelFilters?, frames: Int): FloatArray {
         val padded = FloatArray(30 * SAMPLE_RATE) { index -> samples.getOrElse(index) { 0f } }
         val window = FloatArray(FFT_SIZE) { index ->
             (0.5 - 0.5 * cos((2.0 * PI * index) / FFT_SIZE)).toFloat()
         }
-        val filters = melFilters(melBins)
+        val filterRows = filters?.rows ?: melFilters(80)
+        val melBins = filterRows.size
         val raw = FloatArray(melBins * frames)
         val power = FloatArray((FFT_SIZE / 2) + 1)
+        val fftIn = FloatArray(FFT_SIZE)
+        val fftOut = FloatArray(FFT_SIZE * 2)
 
         for (frame in 0 until frames) {
             val offset = frame * HOP_LENGTH
-            powerSpectrum(padded, offset, window, power)
+            powerSpectrum(padded, offset, window, fftIn, fftOut, power)
             for (mel in 0 until melBins) {
                 var energy = 0f
-                val filter = filters[mel]
-                for (bin in power.indices) {
+                val filter = filterRows[mel]
+                val bins = minOf(power.size, filter.size)
+                for (bin in 0 until bins) {
                     energy += power[bin] * filter[bin]
                 }
                 raw[(mel * frames) + frame] = (ln(max(energy, 1e-10f)) / ln(10f))
@@ -268,17 +383,80 @@ private object WhisperLogMel {
         }
     }
 
-    private fun powerSpectrum(samples: FloatArray, offset: Int, window: FloatArray, out: FloatArray) {
+    private fun powerSpectrum(
+        samples: FloatArray,
+        offset: Int,
+        window: FloatArray,
+        fftIn: FloatArray,
+        fftOut: FloatArray,
+        out: FloatArray,
+    ) {
+        for (i in 0 until FFT_SIZE) {
+            fftIn[i] = samples.getOrElse(offset + i) { 0f } * window[i]
+        }
+        fft(fftIn, fftOut)
         for (bin in out.indices) {
-            var real = 0.0
-            var imag = 0.0
-            for (n in 0 until FFT_SIZE) {
-                val sample = samples.getOrElse(offset + n) { 0f } * window[n]
-                val angle = (2.0 * PI * bin * n) / FFT_SIZE
-                real += sample * cos(angle)
-                imag -= sample * kotlin.math.sin(angle)
+            val real = fftOut[2 * bin]
+            val imag = fftOut[(2 * bin) + 1]
+            out[bin] = (real * real) + (imag * imag)
+        }
+        for (bin in 1 until FFT_SIZE / 2) {
+            out[bin] *= 2f
+        }
+    }
+
+    private fun fft(input: FloatArray, output: FloatArray) {
+        val size = input.size
+        if (size == 1) {
+            output[0] = input[0]
+            output[1] = 0f
+            return
+        }
+        if (size % 2 == 1) {
+            dft(input, output)
+            return
+        }
+
+        val half = size / 2
+        val even = FloatArray(half)
+        val odd = FloatArray(half)
+        for (i in 0 until half) {
+            even[i] = input[i * 2]
+            odd[i] = input[(i * 2) + 1]
+        }
+
+        val evenFft = FloatArray(size)
+        val oddFft = FloatArray(size)
+        fft(even, evenFft)
+        fft(odd, oddFft)
+
+        for (k in 0 until half) {
+            val theta = (2.0 * PI * k / size).toFloat()
+            val twiddleReal = cos(theta).toFloat()
+            val twiddleImag = -kotlin.math.sin(theta)
+            val oddReal = oddFft[2 * k]
+            val oddImag = oddFft[(2 * k) + 1]
+            val rotatedReal = (twiddleReal * oddReal) - (twiddleImag * oddImag)
+            val rotatedImag = (twiddleReal * oddImag) + (twiddleImag * oddReal)
+
+            output[2 * k] = evenFft[2 * k] + rotatedReal
+            output[(2 * k) + 1] = evenFft[(2 * k) + 1] + rotatedImag
+            output[2 * (k + half)] = evenFft[2 * k] - rotatedReal
+            output[(2 * (k + half)) + 1] = evenFft[(2 * k) + 1] - rotatedImag
+        }
+    }
+
+    private fun dft(input: FloatArray, output: FloatArray) {
+        for (k in input.indices) {
+            var real = 0f
+            var imag = 0f
+            for (n in input.indices) {
+                val angle = (2.0 * PI * k * n / input.size).toFloat()
+                real += input[n] * cos(angle).toFloat()
+                imag -= input[n] * kotlin.math.sin(angle)
             }
-            out[bin] = ((real * real) + (imag * imag)).toFloat()
+            output[2 * k] = real
+            output[(2 * k) + 1] = imag
         }
     }
 
@@ -319,37 +497,58 @@ private class LiteRtTokenDecoder(
     private val idToToken: Map<Int, String> = loadVocabulary(context, filesDir)
     private val byteDecoder: Map<Char, Int> = whisperByteDecoder()
 
-    fun decode(outputBuffers: List<TensorBuffer>): String {
-        outputBuffers.forEach { buffer ->
-            readUtf8(buffer)?.let { return it }
-            readIntTokens(buffer)?.let { return it }
-            readLongTokens(buffer)?.let { return it }
-            readFloatTokens(buffer)?.let { return it }
+    fun decode(signature: String, outputBuffers: List<Any>): String {
+        outputBuffers.forEach { output ->
+            readUtf8(output)?.let { return it }
+            readIntTokens(output)?.let { return it }
+            readLongTokens(output)?.let { return it }
+            readFloatTokens(output)?.let { return it }
         }
         error(
-            "LiteRT executou serving_transcribe, mas não consegui decodificar as saídas. " +
-                "Se o modelo retorna IDs/logits, coloque whisper-vocab.txt, vocab.txt ou vocab.json junto do modelo."
+            "LiteRT executou $signature, mas a saida nao e texto nem sequencia de tokens Whisper decodificavel. " +
+                "Este modelo provavelmente retorna logits/estados intermediarios e precisa de loop autoregressivo " +
+                "decoder, que ainda nao esta implementado neste caminho."
         )
     }
 
-    private fun readUtf8(buffer: TensorBuffer): String? {
-        val bytes = runCatching { buffer.readInt8() }.getOrNull() ?: return null
+    private fun readUtf8(output: Any): String? {
+        val bytes = when (output) {
+            is ByteArray -> output
+            is ByteBuffer -> {
+                val duplicate = output.asReadOnlyBuffer()
+                duplicate.rewind()
+                ByteArray(duplicate.remaining()).also(duplicate::get)
+            }
+            else -> return null
+        }
         val text = bytes.takeWhile { it != 0.toByte() }.toByteArray().toString(Charsets.UTF_8).trim()
         return text.takeIf { it.isNotBlank() && it.any(Char::isLetterOrDigit) }
     }
 
-    private fun readIntTokens(buffer: TensorBuffer): String? {
-        val values = runCatching { buffer.readInt() }.getOrNull() ?: return null
+    private fun readIntTokens(output: Any): String? {
+        val values = when (output) {
+            is IntArray -> output
+            is Array<*> -> output.filterIsInstance<IntArray>().flatMap { it.asIterable() }.toIntArray()
+            else -> return null
+        }
         return decodeIds(values.asIterable())
     }
 
-    private fun readLongTokens(buffer: TensorBuffer): String? {
-        val values = runCatching { buffer.readLong() }.getOrNull() ?: return null
+    private fun readLongTokens(output: Any): String? {
+        val values = when (output) {
+            is LongArray -> output
+            is Array<*> -> output.filterIsInstance<LongArray>().flatMap { it.asIterable() }.toLongArray()
+            else -> return null
+        }
         return decodeIds(values.map { it.toInt() })
     }
 
-    private fun readFloatTokens(buffer: TensorBuffer): String? {
-        val values = runCatching { buffer.readFloat() }.getOrNull() ?: return null
+    private fun readFloatTokens(output: Any): String? {
+        val values = when (output) {
+            is FloatArray -> output
+            is Array<*> -> output.filterIsInstance<FloatArray>().flatMap { it.asIterable() }.toFloatArray()
+            else -> return null
+        }
         if (values.isEmpty()) return null
         val directIds = values
             .filter { it.isFinite() }
@@ -366,34 +565,27 @@ private class LiteRtTokenDecoder(
     private fun decodeIds(ids: Iterable<Int>): String? {
         if (idToToken.isEmpty()) return null
         val tokenText = ids
-            .takeWhile { it != 50256 }
-            .filter { it >= 0 }
+            .takeWhile { it !in WHISPER_EOT_TOKENS }
+            .filter { it in 0 until WHISPER_ENGLISH_EOT }
             .mapNotNull { idToToken[it] }
-            .filterNot { it.startsWith("<|") && it.endsWith("|>") }
+            .filterNot(::isSpecialToken)
             .joinToString("")
         val text = decodeWhisperTokenText(tokenText).trim()
         return text.takeIf { it.isNotBlank() }
     }
 
     private fun loadVocabulary(context: Context, filesDir: File): Map<Int, String> {
-        // 1. Tentar carregar do .bin otimizado nos assets (recomendado pelo DocWolle)
         val vocabFiles = listOf(
             "models/filters_vocab_multilingual.bin",
             "models/filters_vocab_en.bin"
         )
         for (vocabPath in vocabFiles) {
-            runCatching {
-                context.assets.open(vocabPath).use { input ->
-                    ObjectInputStream(input).use { ois ->
-                        @Suppress("UNCHECKED_CAST")
-                        val map = ois.readObject() as HashMap<Int, ByteArray>
-                        return map.mapValues { String(it.value, Charsets.UTF_8) }
-                    }
-                }
-            }.getOrNull()?.let { return it }
+            parseFiltersVocabularyBin(context, vocabPath)?.let { vocabulary ->
+                Log.i(DECODER_LOG_TAG, "Loaded DocWolle/whisper.tflite vocabulary path=$vocabPath size=${vocabulary.size}")
+                return vocabulary
+            }
         }
 
-        // 2. Fallback para arquivos no sistema de arquivos (legado)
         val file = listOf(
             "whisper-vocab.txt",
             "vocab.txt",
@@ -407,6 +599,80 @@ private class LiteRtTokenDecoder(
         } else {
             parseTextVocabulary(file.readLines())
         }
+    }
+
+    private fun parseFiltersVocabularyBin(context: Context, vocabPath: String): Map<Int, String>? {
+        return runCatching {
+            val bytes = context.assets.open(vocabPath).use { it.readBytes() }
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val magic = buffer.int
+            if (magic != FILTERS_VOCAB_MAGIC) {
+                Log.w(DECODER_LOG_TAG, "Ignoring vocab path=$vocabPath with unexpected magic=${magic.toString(16)}")
+                return@runCatching null
+            }
+
+            val nMel = buffer.int
+            val nFft = buffer.int
+            val filterBytes = nMel * nFft * Float.SIZE_BYTES
+            require(nMel > 0 && nFft > 0 && buffer.remaining() > filterBytes) {
+                "Invalid filters header nMel=$nMel nFft=$nFft remaining=${buffer.remaining()}"
+            }
+            buffer.position(buffer.position() + filterBytes)
+
+            val baseVocabularySize = buffer.int
+            require(baseVocabularySize in 1..WHISPER_MULTILINGUAL_VOCAB_SIZE) {
+                "Invalid vocabulary size=$baseVocabularySize"
+            }
+            val vocabulary = LinkedHashMap<Int, String>(WHISPER_MULTILINGUAL_VOCAB_SIZE)
+            repeat(baseVocabularySize) { id ->
+                val length = buffer.int
+                require(length >= 0 && length <= buffer.remaining()) {
+                    "Invalid token length=$length id=$id remaining=${buffer.remaining()}"
+                }
+                val tokenBytes = ByteArray(length)
+                buffer.get(tokenBytes)
+                vocabulary[id] = tokenBytes.toString(Charsets.UTF_8)
+            }
+
+            val multilingual = vocabPath.contains("multilingual", ignoreCase = true)
+            val targetVocabularySize = if (multilingual) {
+                WHISPER_MULTILINGUAL_VOCAB_SIZE
+            } else {
+                WHISPER_ENGLISH_VOCAB_SIZE
+            }
+            var tokenEot = WHISPER_ENGLISH_EOT
+            var tokenSot = WHISPER_ENGLISH_SOT
+            var tokenPrev = WHISPER_ENGLISH_PREV
+            var tokenNot = WHISPER_ENGLISH_NO_TIMESTAMPS
+            var tokenBeg = WHISPER_ENGLISH_TIMESTAMP_BEGIN
+            if (multilingual) {
+                tokenEot += 1
+                tokenSot += 1
+                tokenPrev += 1
+                tokenNot += 1
+                tokenBeg += 1
+            }
+
+            for (id in baseVocabularySize until targetVocabularySize) {
+                vocabulary[id] = when {
+                    id > tokenBeg -> "[_TT_${id - tokenBeg}]"
+                    id == tokenEot -> "[_EOT_]"
+                    id == tokenSot -> "[_SOT_]"
+                    id == tokenPrev -> "[_PREV_]"
+                    id == tokenNot -> "[_NOT_]"
+                    id == tokenBeg -> "[_BEG_]"
+                    else -> "[_extra_token_$id]"
+                }
+            }
+            vocabulary
+        }.onFailure { error ->
+            Log.w(DECODER_LOG_TAG, "Failed to load DocWolle/whisper.tflite vocabulary path=$vocabPath", error)
+        }.getOrNull()
+    }
+
+    private fun isSpecialToken(token: String): Boolean {
+        return (token.startsWith("<|") && token.endsWith("|>")) ||
+            (token.startsWith("[_") && token.endsWith("]"))
     }
 
     private fun parseTextVocabulary(lines: List<String>): Map<Int, String> {
@@ -469,5 +735,18 @@ private class LiteRtTokenDecoder(
             }
         }
         return chars.map { it.toChar() }.zip(bytes).toMap()
+    }
+
+    companion object {
+        private const val DECODER_LOG_TAG = "WhisperLiteRt"
+        private const val FILTERS_VOCAB_MAGIC = 0x5553454e
+        private const val WHISPER_ENGLISH_EOT = 50256
+        private const val WHISPER_ENGLISH_SOT = 50257
+        private const val WHISPER_ENGLISH_PREV = 50360
+        private const val WHISPER_ENGLISH_NO_TIMESTAMPS = 50362
+        private const val WHISPER_ENGLISH_TIMESTAMP_BEGIN = 50363
+        private const val WHISPER_ENGLISH_VOCAB_SIZE = 51864
+        private const val WHISPER_MULTILINGUAL_VOCAB_SIZE = 51865
+        private val WHISPER_EOT_TOKENS = setOf(50256, 50257)
     }
 }

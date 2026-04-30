@@ -20,6 +20,9 @@ class LiteRtModelManager(private val context: Context) {
     val quickTranscriptionModel: File
         get() = File(modelDir, QUICK_WHISPER_MODEL_NAME)
 
+    val gemmaAudioModel: File
+        get() = File(modelDir, GEMMA_AUDIO_MODEL_NAME)
+
     fun hasQuickTranscriptionModel(): Boolean {
         return transcriptionModelCandidates().isNotEmpty()
     }
@@ -28,6 +31,15 @@ class LiteRtModelManager(private val context: Context) {
         return BUNDLED_MODEL_NAMES
             .map { File(modelDir, it) }
             .filter { it.exists() && it.length() > 0L }
+    }
+
+    fun preferredTranscriptionModel(): File? {
+        return transcriptionModelCandidates().firstOrNull { it.extension.equals("tflite", ignoreCase = true) }
+            ?: transcriptionModelCandidates().firstOrNull()
+    }
+
+    fun hasGemmaAudioModel(): Boolean {
+        return transcriptionModelCandidates().any { it.extension.equals("litertlm", ignoreCase = true) }
     }
 
     fun describeQuickModel(): String {
@@ -55,8 +67,17 @@ class LiteRtModelManager(private val context: Context) {
         }
     }
 
-    fun importQuickTranscriptionModel(uri: Uri, resolver: ContentResolver): File {
-        val temp = File(quickTranscriptionModel.absolutePath + ".import")
+    fun importQuickTranscriptionModel(
+        uri: Uri,
+        resolver: ContentResolver,
+        displayName: String? = null,
+    ): File {
+        val target = when {
+            displayName?.endsWith(".litertlm", ignoreCase = true) == true -> gemmaAudioModel
+            displayName?.endsWith(".task", ignoreCase = true) == true -> gemmaAudioModel
+            else -> quickTranscriptionModel
+        }
+        val temp = File(target.absolutePath + ".import")
         if (temp.exists()) temp.delete()
 
         resolver.openInputStream(uri)?.use { input ->
@@ -70,19 +91,21 @@ class LiteRtModelManager(private val context: Context) {
             error("O modelo LiteRT selecionado esta vazio.")
         }
 
-        if (quickTranscriptionModel.exists()) quickTranscriptionModel.delete()
-        if (!temp.renameTo(quickTranscriptionModel)) {
-            temp.copyTo(quickTranscriptionModel, overwrite = true)
+        if (target.exists()) target.delete()
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
             temp.delete()
         }
         Log.i(LOG_TAG, "LiteRT model imported by user: ${describeQuickModel()}")
-        return quickTranscriptionModel
+        return target
     }
 
     companion object {
         private const val LOG_TAG = "LiteRtModelManager"
         const val QUICK_WHISPER_MODEL_NAME = "whisper-base-transcribe-translate.tflite"
+        const val GEMMA_AUDIO_MODEL_NAME = "gemma-audio.litertlm"
         private val BUNDLED_MODEL_NAMES = listOf(
+            GEMMA_AUDIO_MODEL_NAME,
             QUICK_WHISPER_MODEL_NAME,
             "whisper-base.pt.tflite",
         )

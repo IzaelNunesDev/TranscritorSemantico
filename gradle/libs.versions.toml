@@ -11,6 +11,7 @@ composeBom = "2024.09.00"
 coroutines = "1.10.2"
 gson = "2.13.1"
 litert = "2.1.0"
+litertlm = "0.10.0"
 fragment = "1.8.9"
 
 [libraries]
@@ -33,6 +34,7 @@ androidx-compose-material-icons-extended = { group = "androidx.compose.material"
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 litert = { group = "com.google.ai.edge.litert", name = "litert", version.ref = "litert" }
+litertlm = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
 androidx-fragment-ktx = { group = "androidx.fragment", name = "fragment-ktx", version.ref = "fragment" }
 
 [plugins]
