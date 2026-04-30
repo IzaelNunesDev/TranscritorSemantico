@@ -392,9 +392,14 @@ private object WhisperLogMel {
         out: FloatArray,
     ) {
         for (i in 0 until FFT_SIZE) {
-            fftIn[i] = samples.getOrElse(offset + i) { 0f } * window[i]
+            // Evita a alocação da lambda do getOrElse, tornando o loop mais limpo
+            val sample = if (offset + i < samples.size) samples[offset + i] else 0f
+            fftIn[i] = sample * window[i]
         }
-        fft(fftIn, fftOut)
+
+        // Executa a nova FFT in-place com ZERO alocações
+        fft(fftIn, 0, 1, fftOut, 0, FFT_SIZE)
+
         for (bin in out.indices) {
             val real = fftOut[2 * bin]
             val imag = fftOut[(2 * bin) + 1]
@@ -405,58 +410,63 @@ private object WhisperLogMel {
         }
     }
 
-    private fun fft(input: FloatArray, output: FloatArray) {
-        val size = input.size
+    private fun fft(
+        input: FloatArray, inOffset: Int, step: Int,
+        output: FloatArray, outOffset: Int, size: Int
+    ) {
         if (size == 1) {
-            output[0] = input[0]
-            output[1] = 0f
+            output[outOffset] = input[inOffset]
+            output[outOffset + 1] = 0f
             return
         }
         if (size % 2 == 1) {
-            dft(input, output)
+            dft(input, inOffset, step, output, outOffset, size)
             return
         }
 
         val half = size / 2
-        val even = FloatArray(half)
-        val odd = FloatArray(half)
-        for (i in 0 until half) {
-            even[i] = input[i * 2]
-            odd[i] = input[(i * 2) + 1]
-        }
 
-        val evenFft = FloatArray(size)
-        val oddFft = FloatArray(size)
-        fft(even, evenFft)
-        fft(odd, oddFft)
+        // As metades par/ímpar compartilham a matriz final para evitar arrays intermediários
+        fft(input, inOffset, step * 2, output, outOffset, half)
+        fft(input, inOffset + step, step * 2, output, outOffset + size, half)
 
         for (k in 0 until half) {
             val theta = (2.0 * PI * k / size).toFloat()
             val twiddleReal = cos(theta).toFloat()
-            val twiddleImag = -kotlin.math.sin(theta)
-            val oddReal = oddFft[2 * k]
-            val oddImag = oddFft[(2 * k) + 1]
-            val rotatedReal = (twiddleReal * oddReal) - (twiddleImag * oddImag)
-            val rotatedImag = (twiddleReal * oddImag) + (twiddleImag * oddReal)
+            val twiddleImag = -kotlin.math.sin(theta).toFloat()
 
-            output[2 * k] = evenFft[2 * k] + rotatedReal
-            output[(2 * k) + 1] = evenFft[(2 * k) + 1] + rotatedImag
-            output[2 * (k + half)] = evenFft[2 * k] - rotatedReal
-            output[(2 * (k + half)) + 1] = evenFft[(2 * k) + 1] - rotatedImag
+            val evenReal = output[outOffset + 2 * k]
+            val evenImag = output[outOffset + 2 * k + 1]
+
+            val oddReal = output[outOffset + size + 2 * k]
+            val oddImag = output[outOffset + size + 2 * k + 1]
+
+            val rotatedReal = twiddleReal * oddReal - twiddleImag * oddImag
+            val rotatedImag = twiddleReal * oddImag + twiddleImag * oddReal
+
+            output[outOffset + 2 * k] = evenReal + rotatedReal
+            output[outOffset + 2 * k + 1] = evenImag + rotatedImag
+
+            output[outOffset + size + 2 * k] = evenReal - rotatedReal
+            output[outOffset + size + 2 * k + 1] = evenImag - rotatedImag
         }
     }
 
-    private fun dft(input: FloatArray, output: FloatArray) {
-        for (k in input.indices) {
+    private fun dft(
+        input: FloatArray, inOffset: Int, step: Int,
+        output: FloatArray, outOffset: Int, size: Int
+    ) {
+        for (k in 0 until size) {
             var real = 0f
             var imag = 0f
-            for (n in input.indices) {
-                val angle = (2.0 * PI * k * n / input.size).toFloat()
-                real += input[n] * cos(angle).toFloat()
-                imag -= input[n] * kotlin.math.sin(angle)
+            for (n in 0 until size) {
+                val angle = (2.0 * PI * k * n / size).toFloat()
+                val v = input[inOffset + n * step]
+                real += v * cos(angle).toFloat()
+                imag -= v * kotlin.math.sin(angle).toFloat()
             }
-            output[2 * k] = real
-            output[(2 * k) + 1] = imag
+            output[outOffset + 2 * k] = real
+            output[outOffset + 2 * k + 1] = imag
         }
     }
 
@@ -624,6 +634,10 @@ private class LiteRtTokenDecoder(
                 "Invalid vocabulary size=$baseVocabularySize"
             }
             val vocabulary = LinkedHashMap<Int, String>(WHISPER_MULTILINGUAL_VOCAB_SIZE)
+
+            // NOVO: Mapeamento reverso para preservar bytes crus em representação BPE
+            val byteToChar = whisperByteDecoder().entries.associate { it.value to it.key }
+
             repeat(baseVocabularySize) { id ->
                 val length = buffer.int
                 require(length >= 0 && length <= buffer.remaining()) {
@@ -631,7 +645,15 @@ private class LiteRtTokenDecoder(
                 }
                 val tokenBytes = ByteArray(length)
                 buffer.get(tokenBytes)
-                vocabulary[id] = tokenBytes.toString(Charsets.UTF_8)
+
+                // CORREÇÃO: Ao invés de usar tokenBytes.toString(Charsets.UTF_8),
+                // usamos a ponte GPT-2 BPE pra não quebrar a decodificação:
+                val sb = java.lang.StringBuilder(length)
+                for (b in tokenBytes) {
+                    val unsignedByte = b.toInt() and 0xFF
+                    sb.append(byteToChar[unsignedByte] ?: unsignedByte.toChar())
+                }
+                vocabulary[id] = sb.toString()
             }
 
             val multilingual = vocabPath.contains("multilingual", ignoreCase = true)
